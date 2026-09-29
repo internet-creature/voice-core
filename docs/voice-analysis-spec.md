@@ -1,4 +1,4 @@
-# voice analysis prototype — technical spec v2.3
+# voice analysis prototype — technical spec v2.4
 
 phase 0 deliverable. the goal is not a game. the goal is to answer "is the tracking good enough to build on?" with numbers, before any engine work happens.
 
@@ -259,14 +259,15 @@ descending glides and the bottom of range generate a lot of creak in practice se
 - **exact difference function, fixed integration window, centered on the buffer:**
 
   ```
-  buffer B = 2048, max lag τmax = 800, integration length W = B − τmax = 1248
-  (26 ms — longer than the longest period searched, 16.7 ms at 60 Hz)
+  buffer B = 2048, max lag τmax = 800, evaluated to τmax + 24 = 824 (v2.4)
+  integration length W = B − 824 = 1224
+  (25.5 ms — longer than the longest period searched, 16.7 ms at 60 Hz)
 
   h(τ) = B/2 − ⌊(W + τ)/2⌋                     (start of the compared pair)
-  d(τ) = Σ_{j=0}^{W−1} (x[h+j] − x[h+j+τ])²     for τ = 1..τmax
+  d(τ) = Σ_{j=0}^{W−1} (x[h+j] − x[h+j+τ])²     for τ = 1..824
   ```
 
-  the two compared windows together span `[h, h + τ + W)`, whose center sits within half a sample of the buffer center for every τ. at τmax, h = 0 and the pair fills the buffer exactly.
+  the two compared windows together span `[h, h + τ + W)`, whose center sits within half a sample of the buffer center for every τ. at the last lag, h = 0 and the pair fills the buffer exactly. the 24 lags past τmax exist so the floor can be judged on a refined minimum, not on the edge of the array (below).
 
   **why a fixed window (v2.3):** v2 summed over `2048 − τ` terms, so d(τ) shrank at longer lags just because it had fewer terms. the YIN paper (de Cheveigné & Kawahara 2002) uses a fixed integration window to avoid exactly this. the shrinking sum favors long lags, which means octave-down errors. that bias only matters where 2τ fits inside the search range (f0 above ~120 Hz), so it lands on higher voices. it bites hardest when no dip clears the 0.15 threshold (breathy or noisy frames) and the global-minimum fallback decides.
 
@@ -275,15 +276,21 @@ descending glides and the bottom of range generate a lot of creak in practice se
   **compute it directly.** the centered placement means each lag uses a different window, so the single-FFT cross-correlation shortcut no longer applies. the direct sum is W·τmax ≈ 1 M multiply-adds per hop (~100 M/s). with `System.Numerics.Vector<float>` (8 lanes on AVX2) that's a few percent of one core. accumulate in float32 SIMD lanes and reduce in float64. **measure it at step 4** against the Gate B capture-to-result budget. if it doesn't fit (Steam Deck included), the fallback is the one-sided FFT form plus an explicit per-frame timestamp correction of `(W + τ)/2 − B/2` samples, and the glide tests below then gate that correction. a scalar float64 version of the same formula stays in `VoiceCore.Tests` as the **test oracle**, checked against the SIMD d(τ) on random and synthetic buffers.
 
 - cumulative mean normalized difference `d′(τ) = d(τ)·τ / Σ_{j=1..τ} d(j)`, `d′(0) = 1`
-- absolute threshold 0.15 — take the **first** local minimum below it, searching from **τ = 2**, not from τmin (see "out-of-range fundamentals" below); if none, take the global minimum within `[τmin, τmax]` and mark low confidence
+- absolute threshold 0.15 — take the **first** dip below it, searching from **τ = 2**, not from τmin (see "out-of-range fundamentals" below); if none, take the global minimum within `[τmin, τmax]` and mark low confidence
 - parabolic interpolation over the three points around the minimum for sub-sample lag
 - output `f0RawHz` (always, per §3.3), and `f0Cents = 1200 · log2(f0 / 55.0)` — fixed 55 Hz anchor so the number is stable across sessions
+
+**lag choice as built (v2.4, build step 4).** the plain rules above failed the §3.4 gates on breathy, noisy and floor-edge signals. each change below keeps the spec's behavior on clean signals, where the absolute threshold still decides:
+
+- **dips are valleys, found on a lightly smoothed d′.** a "dip" is a contiguous run below the threshold, and its lowest point wins. the location is found on d′ smoothed by a moving average over ±1.5% of the lag (about ±26 cents), then refined to the raw minimum within that span, then parabolically interpolated on raw d′. in breathy frames the valley bottom is broad and flat (e.g. d′ 0.25 ± 0.01 across ±3% of the lag at HNR 5 dB), and picking a single raw sample wandered 100+ cents from noise alone. that broke STABLE and turned breathy frames Unvoiced. a clean valley is symmetric, so smoothing doesn't move it.
+- **octave guard.** after the reference minimum is found (the first valley below 0.15, or the global minimum when there's none), the answer is the *first* valley that gets within 0.1 of the reference's depth. d′ at 2τ or 3τ is often slightly *lower* than at τ, because the cumulative mean it's normalized by keeps growing. breathy frames therefore picked 2τ or 3τ about half the time: the plain global-minimum fallback, and even the first-dip rule when τ's valley sat at 0.16 and 2τ's at 0.14. the guard stops that. the true period comes before its multiples, and a strong-H2 half-period dip is never that deep.
+- **floor margin.** `F0Range = Below` when the refined minimum is more than 25 cents past τmax (under ~59.1 Hz), or the valley runs off the end of the evaluated lags. v2.3 said "the fallback lands at τmax". but a tone exactly at 60 Hz has its minimum exactly at τmax, and with noise the one-sample decision flipped half its frames to Below. the margin is larger than the estimator's jitter.
 
 **out-of-range fundamentals (v2.3, Astra review).** a search that starts at τmin can't see a fundamental above the ceiling, but it can see that fundamental's multiples. a clean 1100 Hz sine has a period of 43.6 samples, just under τmin = 48, but two periods (87.3 samples) land inside the range with d′ ≈ 0. that frame then published as **550.03 Hz Voiced** with near-zero aperiodicity: a confident, folded wrong answer. so d(τ) is computed from τ = 2 (46 extra lags, ~6% more work), and the first-dip search runs from there:
 
 - first qualifying dip at τ < τmin → the fundamental is above the ceiling. the frame is still classified on its aperiodicity as usual (§3.3), but `F0Hz` = NaN and `F0Range = Above`. no in-range multiple is ever accepted in its place. `F0RawHz` logs the true out-of-range estimate.
 - τ = 2 corresponds to 24 kHz, so any tone below Nyquist that could fold into the range is caught. a 300 Hz harmonic complex with a strong 2nd harmonic still reads 300 Hz, because a voice has no periodicity at lags shorter than its period.
-- below the floor (period > τmax) there is no in-range multiple to fold onto. a sub-60 Hz fundamental shows up as a missing or unstable candidate, which is the creak path (§3.3). `F0Range = Below` is set only when the global-minimum fallback lands at τmax, which is what a period too long to fit looks like.
+- below the floor (period > τmax) there is no in-range multiple to fold onto. a sub-60 Hz fundamental shows up as a missing or unstable candidate, which is the creak path (§3.3), or as `F0Range = Below` when its minimum lands clearly past τmax (the floor margin above).
 - **STABLE** (§3.3) and the octave-correction median (§3.5) ignore out-of-range frames, and a hysteresis hold never publishes a folded value.
 - the game treats confident-voiced `F0Range = Above` as a pitch Miss, not an abstention (game doc appendix A). the tracker saw the voice; it's just far past any chart target, since charts are authored ≥ 100 cents inside the search range. `Below` is a weaker signal, and the game abstains on it.
 
@@ -295,6 +302,11 @@ descending glides and the bottom of range generate a lot of creak in practice se
 - endpoint tests at exactly 60 and 1000 Hz, and just outside the range. 55 Hz → `F0Range = Below`, low confidence, or not Voiced. 1100, 1500 and 3000 Hz sustained sines and harmonic complexes → `F0Range = Above` with `F0Hz` = NaN. none of them may publish a folded value (e.g. 550 Hz for an 1100 Hz tone).
 - ceiling-crossing glides (v2.3): sines and harmonic complexes gliding 800 → 1400 → 800 Hz at 1200 and 2400 cents/s. every frame is either within ±5 cents of the true f0 (in range) or `F0Range = Above` (out of range). a frame that publishes a fold is a failure.
 - **timestamp alignment (v2.3):** linear-in-cents glides at ±600, ±1200 and ±2400 cents/s, across 100–900 Hz. the published `F0Hz` must match the synthesized instantaneous f0 at `WindowCenterSample` within ±5 cents at every rate, with no trend in error vs period. this test catches any off-center window. it also re-checks `AlgorithmicDelaySamples` from outside, by cross-correlating the published track against the known contour.
+
+  **refined in v2.4 (build step 4).**
+  - **mean error gate:** every timestamp case must also have mean error within ±1 cent. that's the check that actually catches an off-center window, since that shows up as systematic bias.
+  - **pulse-timing margin:** for harmonic complexes (not sines), the per-frame tolerance adds the glide's change over half a period. a pulse-like signal carries its pitch information at the pulses, so the moment any windowed estimate describes can sit up to half a period from the window center. at 115 Hz on a 2400 cents/s glide that's ±10 cents of frame-to-frame scatter (measured: RMS 2.3, max 9.1 cents), with zero mean and zero slope. sines have no margin and meet ±5 at every rate.
+  - **corners excluded:** frames whose window straddles a contour corner (hold → glide) aren't cents-gated, because the "true f0 at the center" isn't what any windowed estimator measures there. they still count for voicing and gross errors.
 
 ### 3.5 octave error correction
 
@@ -407,6 +419,15 @@ the game abstains based on confidence. frames it can't trust aren't scored, and 
 
   a game floor of 0.9 on `F0Confidence` then means "expect ≤ 10% gross pitch errors among the Voiced frames that get pitch-scored."
 - **raw score.** before calibration, each confidence is a raw score built from evidence the analyzer already has. for f0: 1 − d′ at the chosen lag, candidate stability (§3.3), level above the noise floor, and whether octave correction stepped in. for voicing: distance from the nearest classification threshold, plus hysteresis state.
+
+  as built (v2.4), both are monotone in each input, which is all a calibration map needs:
+  - `F0Confidence` = periodicity × stability × level × dip × hold.
+    - periodicity = `1 − d′/0.45`, clamped to 0..1
+    - stability = 1 if STABLE, else 0.7
+    - level = 0.5–1 over 0–20 dB above the level gate
+    - dip = 1 if a dip cleared 0.15, else 0.5
+    - hold = 0.5 during a hysteresis hold, else 1
+  - `VoicingConfidence` = 0.5 + 0.5 × the margin to the threshold that would change the evidence, normalized to that band and clamped to 0..1. it's 0.5 during a hold.
 - **calibration.** fit a monotone map from raw score to probability on the **dev split** (isotonic regression or binned), then check it on held-out (§6). the calibration table is part of `AnalysisConfig`, so the config hash covers it. recalibrating bumps `AnalyzerVersion`, so the game's PB provenance rule (game doc appendix A) archives old PBs instead of comparing across calibrations.
 - **before step 5** there's no corpus to calibrate against. the raw score is published, and the config records `ConfidenceCalibration = none` so nothing downstream mistakes it for a probability.
 
@@ -587,7 +608,8 @@ sampleRate            (48000; 44100 accepted → resampled)
 inputGainDb
 noiseFloorDbfs        (measured, §3.2)
 voicedLevelMarginDb   (8, §3.3)
-latencyOffsetMs       (measured via loopback; user-to-photon measured separately)
+latencyOffsetMs       (phase 0 baseline via loopback; the game calibrates two
+                      offsets per player instead: game doc §1.7)
 f0SearchMinHz         (60)
 f0SearchMaxHz         (1000; 600 fallback per §3.4)
 maxFormantHz          (5500 default; drives fs_a, LPC order, root range — §3.6)
@@ -633,6 +655,13 @@ v2.3 (2026-09-28, fresh-eyes review before any code):
 - **resonance**: the brightness proxy's confound with spectral tilt/effort is spelled out as a strain incentive. specificity is a gate criterion with cross-talk corpus tasks. a tilt-normalized variant is added. `SpectralTiltDbPerKhz` is published (§3.7b). LPC degradation at high f0 is noted, and metrics are sliced by f0 band (§3.6, §6).
 - **corpus**: real recordings are the product gate. a recording-sources section covers paid voice actors (one actor = one speaker; record multiple devices at once), own sessions, volunteers, and public laryngograph-referenced corpora with license checks. trans and mid-transition voices are named as coverage (§6).
 - **project**: the probe moves from Avalonia to Godot. MathNet is replaced by a preallocated root finder (it allocated per call, breaking §1.1). the TFM note covers .NET 8 end of support (§1, §1.2). build order: live pitch trace at step 4, capture-path comparison at step 3 (§8).
+
+v2.4 (2026-09-29, build step 4 findings — YIN and voicing implemented and gated against the synthetic suites):
+
+- **YIN lag choice** (§3.4): valleys found on d′ smoothed over ±1.5% of the lag, refined on raw d′. an octave guard takes the first valley within 0.1 of the reference minimum. `Below` requires the refined minimum more than 25 cents past τmax, so d′ is evaluated to τmax + 24 and W = 1224. without these, breathy frames picked 2τ or 3τ about half the time, flat valleys jittered 100+ cents, and exact-60 Hz tones flipped to Below.
+- **timestamp-alignment gate** (§3.4): a mean-error gate of ±1 cent (the real off-center check), a pulse-timing margin for harmonic complexes on glides, and contour corners excluded from the cents gate. per frame, ±5 cents at 2400 cents/s is physically unreachable for pulse-like signals at low f0. sines still meet ±5 everywhere.
+- **raw confidences defined** (§3.9).
+- **measured cost:** 0.14 ms mean, 0.33 ms p99 per frame on a desktop (AVX2), ~1.5% of one core. the direct sum stands; the FFT fallback isn't needed there. `VoiceCore.Batch bench` repeats the measurement on a Steam Deck.
 
 v2.3 fixes from the Astra review (numerically checked with small probes; no implementation existed yet):
 

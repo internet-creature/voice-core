@@ -128,10 +128,14 @@ public class VoiceAnalyzerTests
     [Fact]
     public void UnimplementedMeasurementsAreNaN()
     {
+        // pitch and voicing arrive in step 4; the display track (§3.5), formants,
+        // CPP and the brightness proxy are later steps
         var f = TestSignals.Analyze(TestSignals.Busy(5000), () => 5000)[0];
+        Assert.Equal(VoicingState.Voiced, f.Voicing);
+        Assert.False(float.IsNaN(f.F0Hz));
         float[] notYet =
         [
-            f.VoicingConfidence, f.F0RawHz, f.F0Hz, f.F0DisplayHz, f.F0Cents, f.F0Confidence, f.Aperiodicity,
+            f.F0DisplayHz,
             f.F1Hz, f.B1Hz, f.F2Hz, f.B2Hz, f.F3Hz, f.B3Hz, f.F4Hz, f.B4Hz, f.FormantConfidence,
             f.CppDb, f.BrightnessProxy, f.SpectralTiltDbPerKhz,
         ];

@@ -8,8 +8,9 @@ namespace VoiceCore;
 /// produces identical frames — batch and live use this one path.
 /// </summary>
 /// <remarks>
-/// Build step 1: the skeleton. Frames carry real timestamps and level (§3.2);
-/// every other measurement is NaN until its build step lands.
+/// Build step 4: timestamps, level (§3.2), the voicing decision (§3.3) and YIN f0
+/// (§3.4). Octave correction and the display track (§3.5), formants, CPP and the
+/// brightness proxy are NaN until their steps land.
 /// </remarks>
 public sealed class VoiceAnalyzer
 {
@@ -19,18 +20,25 @@ public sealed class VoiceAnalyzer
 
     private const int HistoryMask = WindowSamples - 1;
     private const float MinDbfs = -120f;
+    private const float NoiseFloorLowestDbfs = -100f;  // don't chase digital silence (a muted mic) all the way down
 
     private readonly float _dcPole;
     private readonly float _clippingLinear;
+    private readonly float _floorAlpha;
+    private readonly Yin _yin;
+    private readonly VoicingStateMachine _voicing;
 
     // the last WindowSamples samples, indexed by capture sample index & HistoryMask
     private readonly float[] _raw = new float[WindowSamples];
     private readonly float[] _filtered = new float[WindowSamples];
+    private readonly float[] _window = new float[WindowSamples];  // the current window, oldest first
 
     private long _nextSample;    // capture index of the next input sample
     private long _nextFrameEnd;  // exclusive end of the next frame's window
     private double _dcPrevIn;
     private double _dcPrevOut;
+    private float _calibratedNoiseFloorDbfs;
+    private float _noiseFloorDbfs;
 
     public VoiceAnalyzer(AnalysisConfig config)
     {
@@ -39,6 +47,10 @@ public sealed class VoiceAnalyzer
         Config = config;
         _dcPole = config.DcFilterPole;
         _clippingLinear = MathF.Pow(10f, config.ClippingThresholdDbfs / 20f);
+        _floorAlpha = 1f - MathF.Exp(-(HopSamples / (float)SampleRate) / config.NoiseFloorTimeConstantSeconds);
+        _yin = new Yin(config);
+        _voicing = new VoicingStateMachine(config);
+        _calibratedNoiseFloorDbfs = config.DefaultNoiseFloorDbfs;
         Reset();
     }
 
@@ -53,6 +65,28 @@ public sealed class VoiceAnalyzer
     public AnalyzerDiagnostics Diagnostics { get; } = new();
 
     /// <summary>
+    /// The session's measured noise floor (spec §3.2: 2 s of instructed silence →
+    /// 10th percentile of hop RMS). Setting it also restarts adaptation from it;
+    /// <see cref="Reset"/> returns to it. Defaults to
+    /// <see cref="AnalysisConfig.DefaultNoiseFloorDbfs"/>. A calibration measurement,
+    /// not config: log it with the session, it isn't in the config hash.
+    /// </summary>
+    public float CalibratedNoiseFloorDbfs
+    {
+        get => _calibratedNoiseFloorDbfs;
+        set
+        {
+            if (!float.IsFinite(value))
+                throw new ArgumentOutOfRangeException(nameof(value));
+            _calibratedNoiseFloorDbfs = value;
+            _noiseFloorDbfs = value;
+        }
+    }
+
+    /// <summary>The noise floor now, after slow adaptation during Silence frames.</summary>
+    public float NoiseFloorDbfs => _noiseFloorDbfs;
+
+    /// <summary>
     /// Clears all temporal state. Call on stream start and after any capture gap.
     /// The frame grid restarts at <paramref name="nextSampleIndex"/>: the first
     /// frame's window begins there.
@@ -65,6 +99,8 @@ public sealed class VoiceAnalyzer
         _dcPrevOut = 0;
         _nextSample = nextSampleIndex;
         _nextFrameEnd = nextSampleIndex + WindowSamples;
+        _noiseFloorDbfs = _calibratedNoiseFloorDbfs;
+        _voicing.Reset();
     }
 
     /// <summary>
@@ -117,31 +153,100 @@ public sealed class VoiceAnalyzer
         long end = _nextFrameEnd;
         long center = end - WindowSamples / 2;
 
-        // level over the hop centered on the window center, so it describes the
-        // same moment as every other measurement. RMS uses the DC-removed signal;
-        // peak and clipping use the raw input, since clipping happens before any filter.
+        // level and ZCR over the hop centered on the window center, so they describe
+        // the same moment as every other measurement. RMS and ZCR use the DC-removed
+        // signal; peak and clipping use the raw input, since clipping happens before
+        // any filter.
         double sumSquares = 0;
         float peak = 0f;
+        int signChanges = 0;
+        bool previousNegative = _filtered[(int)((center - HopSamples / 2 - 1) & HistoryMask)] < 0;
         for (long i = center - HopSamples / 2; i < center + HopSamples / 2; i++)
         {
             int slot = (int)(i & HistoryMask);
-            double f = _filtered[slot];
-            sumSquares += f * f;
+            float f = _filtered[slot];
+            sumSquares += (double)f * f;
             peak = MathF.Max(peak, MathF.Abs(_raw[slot]));
+            bool negative = f < 0;
+            if (negative != previousNegative)
+                signChanges++;
+            previousNegative = negative;
         }
+        float rmsDbfs = PowerToDbfs(sumSquares / HopSamples);
+        float zcrPerSecond = signChanges * (SampleRate / (float)HopSamples);
+
+        // §3.3 step 1: level gate
+        float gate = _noiseFloorDbfs + Config.VoicedLevelMarginDb;
+        bool hasEnergy = rmsDbfs > gate;
+
+        // step 2: f0 candidate on every frame with energy, and on quiet frames while a
+        // hold is pending, so a held Voiced frame can publish its own candidate
+        F0Candidate? candidate = null;
+        if (hasEnergy || _voicing.NeedsCandidateWhenQuiet)
+        {
+            CopyWindow(end);
+            candidate = _yin.Estimate(_window);
+        }
+
+        // steps 3–4: classify, creak votes, hysteresis
+        var decision = _voicing.Decide(hasEnergy, hasEnergy ? candidate : null, zcrPerSecond, rmsDbfs - gate);
+
+        if (decision.State == VoicingState.Silence)
+            _noiseFloorDbfs = MathF.Max(NoiseFloorLowestDbfs, _noiseFloorDbfs + _floorAlpha * (rmsDbfs - _noiseFloorDbfs));
 
         var frame = AnalysisFrame.Unmeasured with
         {
             WindowCenterSample = center,
             ResultAvailableSample = end,
             TimeSeconds = center / (double)SampleRate,
-            RmsDbfs = PowerToDbfs(sumSquares / HopSamples),
+            RmsDbfs = rmsDbfs,
             PeakDbfs = AmplitudeToDbfs(peak),
             Clipping = peak > _clippingLinear,
+            Voicing = decision.State,
+            VoicingConfidence = decision.Confidence,
         };
+
+        if (candidate is { } c)
+        {
+            frame = frame with { F0RawHz = c.F0Hz, Aperiodicity = c.Aperiodicity };
+            if (decision.State == VoicingState.Voiced)
+            {
+                bool inRange = c.Range == F0Range.In;
+                frame = frame with
+                {
+                    F0Range = c.Range,
+                    F0Hz = inRange ? c.F0Hz : float.NaN,
+                    F0Cents = inRange ? 1200f * MathF.Log2(c.F0Hz / 55f) : float.NaN,
+                    F0Confidence = inRange ? F0Confidence(c, decision, rmsDbfs - gate) : float.NaN,
+                };
+            }
+        }
 
         Diagnostics.RecordFrame(Stopwatch.GetTimestamp() - started);
         return frame;
+    }
+
+    /// <summary>
+    /// Raw f0 confidence (§3.9, uncalibrated until build step 5): periodicity
+    /// (1 − d′, scaled over the voiced range), times factors for candidate stability,
+    /// level above the gate, whether a real dip was found, and hysteresis holds.
+    /// Monotone in each input, which is all a calibration map needs.
+    /// </summary>
+    private float F0Confidence(F0Candidate c, VoicingDecision decision, float levelAboveGateDb)
+    {
+        float periodicity = Math.Clamp(1f - c.Aperiodicity / Config.BreathyAperiodicityMax, 0f, 1f);
+        float stability = decision.Stable ? 1f : 0.7f;
+        float level = 0.5f + 0.5f * Math.Clamp(levelAboveGateDb / 20f, 0f, 1f);
+        float dip = c.FoundDip ? 1f : 0.5f;
+        float hold = decision.Holding ? 0.5f : 1f;
+        return periodicity * stability * level * dip * hold;
+    }
+
+    private void CopyWindow(long end)
+    {
+        int start = (int)((end - WindowSamples) & HistoryMask);
+        _filtered.AsSpan(start).CopyTo(_window);
+        _filtered.AsSpan(0, start).CopyTo(_window.AsSpan(WindowSamples - start));
     }
 
     private static float PowerToDbfs(double meanSquare) =>

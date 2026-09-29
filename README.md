@@ -2,7 +2,7 @@
 
 VoiceCore is the voice analysis engine for a voice training game (Godot 4 + C#, for Steam). It is a streaming analyzer: audio buffers go in, and every 10 ms a frame comes out with pitch, voicing, level, formants and voice-quality measurements.
 
-**Status:** phase 0, build step 3 of 8 (analyzer spec §8): streaming skeleton, timing model, synthetic test harness, and the Godot capture probe with a level meter and latency tests. Frames carry timestamps and level; pitch, voicing, formants and the rest are `NaN` until their steps land.
+**Status:** phase 0, build step 4 of 8 (analyzer spec §8), part a: YIN pitch tracking and the voicing state machine, gated against the synthetic suites. Frames carry timestamps, level, voicing and f0; the display track, formants and voice quality are `NaN` until their steps land. Part b (the live pitch trace in the probe) is next.
 
 ## Build
 

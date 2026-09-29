@@ -20,6 +20,12 @@ public readonly record struct FrameTruth
     /// <summary>The window sits inside one segment's steady part, clear of edges and ramps.</summary>
     public bool Steady { get; init; }
 
+    /// <summary>
+    /// True f0 is one straight line (in cents) across the window, so the value at the
+    /// center is what a centered estimator should report. False across contour corners.
+    /// </summary>
+    public bool LinearTruth { get; init; }
+
     /// <summary>Seconds from the start of the containing segment to the window center.</summary>
     public double SecondsIntoSegment { get; init; }
 
@@ -48,18 +54,19 @@ public enum TruthRange { NotVoiced, In, Above, Below, Straddling }
 /// <summary>
 /// Pitch-error summary over frames that have both a published and a true f0.
 /// </summary>
-public sealed record ErrorSummary(int Compared, double MaxAbsCents, double RmsCents, int GrossErrors, int OctaveErrors, double CentsPerPeriodMsSlope)
+public sealed record ErrorSummary(int Compared, double MaxAbsCents, double RmsCents, double MeanCents, int GrossErrors, int OctaveErrors, double CentsPerPeriodMsSlope)
 {
     public static ErrorSummary Of(IEnumerable<FrameTruth> frames)
     {
         var both = frames.Where(f => !double.IsNaN(f.CentsError)).ToList();
         if (both.Count == 0)
-            return new ErrorSummary(0, double.NaN, double.NaN, 0, 0, double.NaN);
+            return new ErrorSummary(0, double.NaN, double.NaN, double.NaN, 0, 0, double.NaN);
         var fine = both.Where(f => !f.IsGrossError).ToList();
         return new ErrorSummary(
             both.Count,
             both.Max(f => Math.Abs(f.CentsError)),
             fine.Count == 0 ? double.NaN : Math.Sqrt(fine.Average(f => f.CentsError * f.CentsError)),
+            fine.Count == 0 ? double.NaN : fine.Average(f => f.CentsError),
             both.Count(f => f.IsGrossError),
             both.Count(f => f.IsOctaveError),
             Slope(fine.Select(f => (1000 / f.TrueF0Hz, f.CentsError)).ToList()));
@@ -108,6 +115,7 @@ public static class Harness
             WindowMinF0Hz = min,
             WindowMaxF0Hz = max,
             Steady = signal.IsSteady(start, end),
+            LinearTruth = signal.IsF0Linear(start, end),
             SecondsIntoSegment = (center - signal.SegmentStartAt(center)) / (double)SyntheticSignal.SampleRate,
         };
     }
@@ -131,7 +139,7 @@ public static class Harness
     /// <see cref="CaseExpectation.SettleSeconds"/> into their segment, are not
     /// scored. Per-frame rules by true range (spec §3.4):
     /// <list type="bullet">
-    /// <item>In: must be Voiced if required; a Voiced frame must publish a finite, positive F0Hz; then within the cents tolerance if set, and never a gross error if octave errors are banned.</item>
+    /// <item>In: must be Voiced if required; a Voiced frame must publish a finite, positive F0Hz; then within the cents tolerance if set (only where <see cref="FrameTruth.LinearTruth"/>: across a contour corner the center value isn't a fair target), and never a gross error if octave errors are banned.</item>
     /// <item>Above: <c>F0Range = Above</c> with <c>F0Hz</c> NaN. Never a folded value.</item>
     /// <item>Below: <c>F0Range = Below</c>, not Voiced, <c>F0Hz</c> NaN, or F0Confidence below the floor.</item>
     /// <item>Straddling the range edge: may abstain, but a published F0Hz must not be a gross error.</item>
@@ -156,8 +164,8 @@ public static class Harness
                 // out of tolerance, so without this a pitchless frame could pass
                 TruthRange.In when f.Voicing == VoicingState.Voiced && !(float.IsFinite(f.F0Hz) && f.F0Hz > 0)
                     => $"no pitch published: Voiced with F0Hz = {f.F0Hz}",
-                TruthRange.In when expect.MaxAbsCents is { } tol && !(Math.Abs(t.CentsError) <= tol)
-                    => $"error {t.CentsError:+0.0;-0.0} cents exceeds ±{tol}",
+                TruthRange.In when expect.MaxAbsCents is { } tol && t.LinearTruth && !(Math.Abs(t.CentsError) <= Tolerance(tol, t, expect))
+                    => $"error {t.CentsError:+0.0;-0.0} cents exceeds ±{Tolerance(tol, t, expect):0.0}",
                 TruthRange.In when expect.NoOctaveErrors && t.IsGrossError
                     => $"gross error ({t.CentsError:+0;-0} cents)",
                 TruthRange.Above when f.F0Range != F0Range.Above || !float.IsNaN(f.F0Hz)
@@ -173,7 +181,29 @@ public static class Harness
                 failures.Add($"t={f.TimeSeconds:0.000}s true={t.TrueF0Hz:0.0}Hz: {problem}");
         }
 
-        return new CaseResult(failures.Count == 0, scored.Count, ErrorSummary.Of(scored), failures);
+        var summary = ErrorSummary.Of(scored);
+        if (expect.MaxMeanCents is { } maxMean)
+        {
+            var linear = scored.Where(t => t.LinearTruth && RangeOf(t) == TruthRange.In && !double.IsNaN(t.CentsError) && !t.IsGrossError).ToList();
+            double mean = linear.Count == 0 ? double.NaN : linear.Average(t => t.CentsError);
+            if (!(Math.Abs(mean) <= maxMean))
+                failures.Add($"mean error {mean:+0.00;-0.00} cents exceeds ±{maxMean} (systematic bias, e.g. an off-center window)");
+        }
+        return new CaseResult(failures.Count == 0, scored.Count, summary, failures);
+    }
+
+    /// <summary>
+    /// Per-frame cents tolerance. With <see cref="CaseExpectation.AllowPulseTiming"/>,
+    /// adds the glide's change over half a period: in a pulse-like signal the pitch
+    /// information sits at the pulses, so the moment an estimate describes can sit up
+    /// to half a period from the window center. Zero for steady tones.
+    /// </summary>
+    public static double Tolerance(double baseCents, FrameTruth t, CaseExpectation expect)
+    {
+        if (!expect.AllowPulseTiming || double.IsNaN(t.WindowMinF0Hz))
+            return baseCents;
+        double centsPerSecond = 1200 * Math.Log2(t.WindowMaxF0Hz / t.WindowMinF0Hz) / (VoiceAnalyzer.WindowSamples / (double)VoiceAnalyzer.SampleRate);
+        return baseCents + centsPerSecond * 0.5 / t.TrueF0Hz;
     }
 }
 
@@ -181,6 +211,19 @@ public static class Harness
 public sealed record CaseExpectation
 {
     public double? MaxAbsCents { get; init; }
+
+    /// <summary>
+    /// Gate on the mean error over linear in-range frames: the check that actually
+    /// catches an off-center window, since that shows up as systematic bias.
+    /// </summary>
+    public double? MaxMeanCents { get; init; }
+
+    /// <summary>
+    /// Widen the per-frame tolerance on glides by the pitch change over half a period
+    /// (see <see cref="Harness.Tolerance"/>). For pulse-like (harmonic-rich) signals,
+    /// where per-frame timing is only defined to within the pulse spacing.
+    /// </summary>
+    public bool AllowPulseTiming { get; init; }
     public bool NoOctaveErrors { get; init; } = true;
     public bool RequireVoiced { get; init; } = true;
 

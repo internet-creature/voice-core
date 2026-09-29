@@ -54,6 +54,9 @@ public sealed class PitchContour
             points.Select(p => Math.Log2(p.Hz)).ToArray());
     }
 
+    /// <summary>Times where the contour changes slope (every point, including hold edges).</summary>
+    public IReadOnlyList<double> BreakpointSeconds => _seconds;
+
     /// <summary>Time of the last point; the contour holds after it.</summary>
     public double Seconds => _seconds[^1];
 
