@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 
 namespace VoiceCore;
 
@@ -88,6 +89,9 @@ internal sealed class Yin
     public int IntegrationLength => _integration;
 
     /// <summary>Estimates f0 from a 2048-sample window (oldest first). No allocation.</summary>
+    // live capture has no warm-up: compile fully optimized on the first call, not in
+    // tier 0, where the Vector<T> loop is several times slower
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public F0Candidate Estimate(ReadOnlySpan<float> window)
     {
         Difference(window, _d, _lastLag, _integration);
@@ -169,6 +173,9 @@ internal sealed class Yin
     /// Centered moving average of d′ over ±1.5% of the lag, shrunk near the ends of
     /// the array so it stays symmetric. Uses a running prefix sum: O(lags).
     /// </summary>
+    // live capture has no warm-up: compile fully optimized on the first call, not in
+    // tier 0, where the Vector<T> loop is several times slower
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void Smooth()
     {
         // _prefix[i] = Σ_{j<i} d′(j)
@@ -188,6 +195,9 @@ internal sealed class Yin
     /// d(τ) = Σ_{j&lt;W} (x[h+j] − x[h+j+τ])² for τ = 1..maxLag, with the pair centered on
     /// the window (h = B/2 − ⌊(W+τ)/2⌋). d[0] = 0. Float SIMD lanes, double reduction.
     /// </summary>
+    // live capture has no warm-up: compile fully optimized on the first call, not in
+    // tier 0, where the Vector<T> loop is several times slower
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void Difference(ReadOnlySpan<float> x, Span<double> d, int maxLag, int integration)
     {
         if (x.Length != VoiceAnalyzer.WindowSamples)

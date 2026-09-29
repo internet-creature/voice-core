@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace VoiceCore;
 
@@ -117,6 +118,7 @@ public sealed class VoiceAnalyzer
     /// <paramref name="output"/> is shorter than <see cref="MaxFramesFor"/>
     /// of the input length (a caller bug, not a runtime state).
     /// </exception>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]  // no tier-0 phase in live use
     public int Process(ReadOnlySpan<float> input, Span<AnalysisFrame> output)
     {
         if (output.Length < MaxFramesFor(input.Length))
@@ -146,6 +148,7 @@ public sealed class VoiceAnalyzer
         return written;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]  // no tier-0 phase in live use
     private AnalysisFrame AnalyzeFrame()
     {
         long started = Stopwatch.GetTimestamp();

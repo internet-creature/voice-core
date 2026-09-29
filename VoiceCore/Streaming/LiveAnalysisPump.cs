@@ -29,6 +29,8 @@ public sealed class LiveAnalysisPump : IDisposable
     private readonly AnalysisFrame[] _frameScratch = new AnalysisFrame[VoiceAnalyzer.MaxFramesFor(MaxBacklogSamples)];
 
     private long _position;  // capture index of the next sample to analyze
+    private int _pendingNoiseFloorBits = NoPendingFloor;  // float bits, handed over from any thread
+    private const int NoPendingFloor = unchecked((int)0xFFC00000);  // a NaN pattern
     private Thread? _thread;
     private volatile bool _stopRequested;
 
@@ -77,6 +79,7 @@ public sealed class LiveAnalysisPump : IDisposable
     /// </summary>
     public int PumpOnce()
     {
+        ApplyPendingNoiseFloor();
         int total = 0;
         long target = _audio.PublishedIndex;
         while (_position < target && !_stopRequested)
@@ -123,6 +126,25 @@ public sealed class LiveAnalysisPump : IDisposable
             AfterChunk?.Invoke();
         }
         return total;
+    }
+
+    /// <summary>
+    /// Sets the analyzer's calibrated noise floor (§3.2) from any thread. The analyzer
+    /// belongs to the analysis thread, so the value is handed over and applied at the
+    /// start of the next <see cref="PumpOnce"/>, between frames.
+    /// </summary>
+    public void SetCalibratedNoiseFloor(float dbfs)
+    {
+        if (dbfs is not (>= -120f and <= 0f))
+            throw new ArgumentOutOfRangeException(nameof(dbfs), dbfs, "Noise floor must be in [-120, 0] dBFS.");
+        Interlocked.Exchange(ref _pendingNoiseFloorBits, BitConverter.SingleToInt32Bits(dbfs));
+    }
+
+    private void ApplyPendingNoiseFloor()
+    {
+        int bits = Interlocked.Exchange(ref _pendingNoiseFloorBits, NoPendingFloor);
+        if (bits != NoPendingFloor)
+            _analyzer.CalibratedNoiseFloorDbfs = BitConverter.Int32BitsToSingle(bits);
     }
 
     /// <summary>Starts the dedicated analysis thread (not the thread pool).</summary>

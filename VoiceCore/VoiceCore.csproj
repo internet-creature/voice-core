@@ -1,9 +1,12 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- real-time DSP: optimized even in Debug. Godot builds the game in Debug when run
+         from the editor, and unoptimized YIN more than doubled capture-to-result. -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
 
   <ItemGroup>

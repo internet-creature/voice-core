@@ -2,7 +2,7 @@
 
 VoiceCore is the voice analysis engine for a voice training game (Godot 4 + C#, for Steam). It is a streaming analyzer: audio buffers go in, and every 10 ms a frame comes out with pitch, voicing, level, formants and voice-quality measurements.
 
-**Status:** phase 0, build step 4 of 8 (analyzer spec §8), part a: YIN pitch tracking and the voicing state machine, gated against the synthetic suites. Frames carry timestamps, level, voicing and f0; the display track, formants and voice quality are `NaN` until their steps land. Part b (the live pitch trace in the probe) is next.
+**Status:** phase 0, build step 4 of 8 (analyzer spec §8): YIN pitch tracking and the voicing state machine, gated against the synthetic suites, with a live pitch trace in the probe. Frames carry timestamps, level, voicing and f0; the display track, formants and voice quality are `NaN` until their steps land.
 
 ## Build
 
@@ -37,12 +37,21 @@ Requires the **.NET build** of Godot 4.7 (`Godot_v4.7.2-stable_mono_win64`). The
 
 Open `VoiceProbe/project.godot` in the Godot editor and press Play. Then:
 
-- **Level meter:** pick a capture path and a device, then press Start. On the native path, prefer the `[Windows WASAPI]` entries: that's the only Windows host API where raw (unprocessed) capture can be requested.
-- **Capture path comparison:** switch between Native (PortAudio) and Godot (AudioEffectCapture). The diagnostics show capture-to-result for each; Gate B requires p95 < 10 ms.
-- **Loopback test:** plays tone bursts on an output and finds them on the selected input. Use VB-Cable (CABLE Input → CABLE Output) for a repeatable baseline, or speakers into the mic for the acoustic path.
-- **Camera test:** tick "flash the screen on a clap", then film yourself clapping next to the screen with a 240 fps phone camera. The frames between the clap and the flash are user-to-photon latency (spec §3.1).
+- **Pitch trace:** pick a capture path and a device, then press Start. On the native path, prefer the `[Windows WASAPI]` entries, since that's the only Windows host API where raw (unprocessed) capture can be requested.
+  - The trace scrolls every analyzed frame on a log-frequency axis, with note and Hz gridlines. The line breaks where you're not voicing, and it fades with confidence.
+  - The strip underneath shows the voicing state: green for Voiced, orange for Creak, grey for Unvoiced.
+  - The readout shows Hz, the nearest note ± cents, and the confidence (a raw score until the corpus calibrates it at step 5).
+  - This is the tracker's raw output, with no smoothing yet (step 6), so glitches are visible on purpose.
+- **Calibrate noise floor:** press it and stay quiet for 2 seconds (spec §3.2). The result is saved per device. The level trace shows the floor and the voicing gate.
+- **Record audio:** off at the start of every session, with a red ● REC timer while on (spec §0).
+  - Recordings go to `%APPDATA%/Godot/app_userdata/VoiceProbe/recordings/`, each with a `.txt` sidecar (device, format, noise floor, analyzer version).
+  - "Delete all recordings" removes them after a confirmation.
+- **Diagnostics tab:** capture-to-result (Gate B requires p95 < 10 ms), overruns, capture gaps, and the capture path comparison (Native vs Godot).
+- **Latency tests tab:**
+  - **Loopback:** plays tone bursts on an output and finds them on the selected input. Use VB-Cable for a repeatable baseline, or hold headphones or speakers to the mic for the acoustic path.
+  - **Camera test:** flashes the screen on a clap. Film it at 240 fps; the frames between the clap and the flash are user-to-photon latency (spec §3.1).
 
-Each session writes a log (device, format, raw-mode status, diagnostics; never audio) to `%APPDATA%/Godot/app_userdata/VoiceProbe/sessions/`.
+Each session writes a log (device, format, raw-mode status, noise floor, diagnostics; never audio) to `%APPDATA%/Godot/app_userdata/VoiceProbe/sessions/`.
 
 Headless checks, from `VoiceProbe/`:
 
@@ -51,6 +60,16 @@ godot_console --headless --path . --build-solutions --quit
 godot_console --headless --path . -- --selftest=AT2020,3
 godot_console --headless --path . -- "--loopback=CABLE Input,CABLE Output"
 ```
+
+## Analyzing recordings and comparing with Praat
+
+```
+dotnet run --project VoiceCore.Batch -c Release -- analyze rec.wav rec.csv
+python -m venv tools/.venv && tools/.venv/Scripts/pip install praat-parselmouth   # once
+tools/.venv/Scripts/python tools/praat_compare.py rec.wav rec.csv
+```
+
+`analyze` runs a 48 kHz WAV through the same streaming path as live capture and writes one CSV row per frame. It uses the recording's saved noise floor when there is one. `praat_compare.py` queries Praat at every frame's center and reports gross and fine f0 disagreement, voicing disagreement, and a state table. Praat is a versioned *comparison baseline* (spec §6), not ground truth, so the script prints its version and every setting.
 
 ## Principles
 

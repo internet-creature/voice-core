@@ -1,8 +1,12 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\VoiceCore\VoiceCore.csproj" />
     <ProjectReference Include="..\VoiceCore.Synthetic\VoiceCore.Synthetic.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VoiceCore.Tests" />
   </ItemGroup>
 
   <PropertyGroup>
