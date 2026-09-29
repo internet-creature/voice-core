@@ -2,7 +2,7 @@
 
 VoiceCore is the voice analysis engine for a voice training game (Godot 4 + C#, for Steam). It is a streaming analyzer: audio buffers go in, and every 10 ms a frame comes out with pitch, voicing, level, formants and voice-quality measurements.
 
-**Status:** phase 0, build step 1 of 8 (analyzer spec §8): streaming skeleton and timing model. Frames carry timestamps and level; pitch, voicing, formants and the rest are `NaN` until their steps land.
+**Status:** phase 0, build step 2 of 8 (analyzer spec §8): streaming skeleton, timing model, and the synthetic signal generator and test harness. Frames carry timestamps and level; pitch, voicing, formants and the rest are `NaN` until their steps land.
 
 ## Build
 
@@ -13,8 +13,14 @@ dotnet test
 ```
 
 - `VoiceCore/` is the analyzer library: no UI, no audio devices, no engine references. `VoiceCore.Streaming` holds the lock-free ring, frame queue, triple buffer and live analysis pump.
+- `VoiceCore.Synthetic/` generates test signals with exact ground truth (sines, harmonic complexes, glides, noise, breathy voice). It also pairs analyzer frames with that truth and defines the spec §3.4 validation suites. It is test tooling and never ships in the game.
 - `VoiceCore.Tests/` holds the xUnit tests, including chunk-boundary invariance and zero-allocation checks.
-- `VoiceCore.Batch/` is a placeholder for batch mode (step 5).
+- `VoiceCore.Batch/` will be batch mode (step 5). For now it exports synthetic signals to listen to or open in Praat:
+
+  ```
+  dotnet run --project VoiceCore.Batch -- synth list breathy
+  dotnet run --project VoiceCore.Batch -- synth breathy/200Hz/hnr5/phase0 breathy.wav
+  ```
 
 ## Docs
 

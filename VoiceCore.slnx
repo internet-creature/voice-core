@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="VoiceCore.Batch/VoiceCore.Batch.csproj" />
+  <Project Path="VoiceCore.Synthetic/VoiceCore.Synthetic.csproj" />
   <Project Path="VoiceCore.Tests/VoiceCore.Tests.csproj" />
   <Project Path="VoiceCore/VoiceCore.csproj" />
 </Solution>
