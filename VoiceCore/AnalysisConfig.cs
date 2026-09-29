@@ -114,24 +114,54 @@ public sealed record AnalysisConfig
     {
         if (string.IsNullOrWhiteSpace(AnalyzerVersion))
             throw new ArgumentException("AnalyzerVersion must be set.");
-        if (!(DcFilterPole > 0f && DcFilterPole < 1f))
-            throw new ArgumentException($"DcFilterPole must be in (0, 1), was {DcFilterPole}.");
-        if (!(ClippingThresholdDbfs <= 0f))
-            throw new ArgumentException($"ClippingThresholdDbfs must be <= 0, was {ClippingThresholdDbfs}.");
-        if (!(NoiseFloorTimeConstantSeconds > 0f))
-            throw new ArgumentException("NoiseFloorTimeConstantSeconds must be positive.");
-        if (!(VoicedAperiodicityMax > 0f && BreathyAperiodicityMax > VoicedAperiodicityMax))
-            throw new ArgumentException("Need 0 < VoicedAperiodicityMax < BreathyAperiodicityMax.");
-        if (!(YinThreshold > 0f && YinThreshold < 1f))
-            throw new ArgumentException("YinThreshold must be in (0, 1).");
-        if (CreakWindowFrames < 1 || CreakVotesRequired < 1 || CreakVotesRequired > CreakWindowFrames || CreakWindowFrames > 32)
-            throw new ArgumentException("Need 1 ≤ CreakVotesRequired ≤ CreakWindowFrames ≤ 32.");
-        if (HysteresisFrames < 1)
-            throw new ArgumentException("HysteresisFrames must be at least 1.");
-        // the integration window W = 2048 − MaxLag must exceed the longest period (§3.4)
-        if (!(F0SearchMinHz > VoiceAnalyzer.SampleRate / (VoiceAnalyzer.WindowSamples / 2.0)))
-            throw new ArgumentException($"F0SearchMinHz must be above {VoiceAnalyzer.SampleRate / (VoiceAnalyzer.WindowSamples / 2.0):0.#} Hz so the YIN window outlasts the longest period.");
-        if (!(F0SearchMaxHz > F0SearchMinHz && MinLag >= 3))
-            throw new ArgumentException("F0SearchMaxHz must exceed F0SearchMinHz and stay below 16 kHz.");
+
+        // every float first: NaN fails every comparison, so without this a NaN
+        // threshold slips through and silently disables voicing (Sol review)
+        Finite(DcFilterPole, nameof(DcFilterPole));
+        Finite(ClippingThresholdDbfs, nameof(ClippingThresholdDbfs));
+        Finite(DefaultNoiseFloorDbfs, nameof(DefaultNoiseFloorDbfs));
+        Finite(NoiseFloorTimeConstantSeconds, nameof(NoiseFloorTimeConstantSeconds));
+        Finite(VoicedLevelMarginDb, nameof(VoicedLevelMarginDb));
+        Finite(VoicedAperiodicityMax, nameof(VoicedAperiodicityMax));
+        Finite(BreathyAperiodicityMax, nameof(BreathyAperiodicityMax));
+        Finite(StableCents, nameof(StableCents));
+        Finite(LowZcrPerSecond, nameof(LowZcrPerSecond));
+        Finite(F0SearchMinHz, nameof(F0SearchMinHz));
+        Finite(F0SearchMaxHz, nameof(F0SearchMaxHz));
+        Finite(YinThreshold, nameof(YinThreshold));
+
+        Require(DcFilterPole > 0f && DcFilterPole < 1f, $"DcFilterPole must be in (0, 1), was {DcFilterPole}.");
+        Require(ClippingThresholdDbfs <= 0f, $"ClippingThresholdDbfs must be <= 0, was {ClippingThresholdDbfs}.");
+        Require(DefaultNoiseFloorDbfs is >= -120f and <= 0f, $"DefaultNoiseFloorDbfs must be in [-120, 0] dBFS, was {DefaultNoiseFloorDbfs}.");
+        Require(NoiseFloorTimeConstantSeconds > 0f, "NoiseFloorTimeConstantSeconds must be positive.");
+        Require(VoicedLevelMarginDb >= 0f, $"VoicedLevelMarginDb must be >= 0, was {VoicedLevelMarginDb}.");
+        Require(VoicedAperiodicityMax > 0f && BreathyAperiodicityMax > VoicedAperiodicityMax,
+            "Need 0 < VoicedAperiodicityMax < BreathyAperiodicityMax.");
+        Require(StableCents > 0f, $"StableCents must be positive, was {StableCents}.");
+        Require(LowZcrPerSecond >= 0f, $"LowZcrPerSecond must be >= 0, was {LowZcrPerSecond}.");
+        Require(YinThreshold > 0f && YinThreshold < 1f, "YinThreshold must be in (0, 1).");
+        Require(CreakWindowFrames >= 1 && CreakVotesRequired >= 1 && CreakVotesRequired <= CreakWindowFrames && CreakWindowFrames <= 32,
+            "Need 1 ≤ CreakVotesRequired ≤ CreakWindowFrames ≤ 32.");
+        Require(HysteresisFrames >= 1, "HysteresisFrames must be at least 1.");
+
+        Require(F0SearchMaxHz > F0SearchMinHz && F0SearchMaxHz <= VoiceAnalyzer.SampleRate / 3f,
+            $"Need F0SearchMinHz < F0SearchMaxHz <= {VoiceAnalyzer.SampleRate / 3} Hz.");
+        // YIN evaluates lags to MaxLag + Yin.ExtraLags, and its integration window
+        // W = 2048 − that must still outlast the longest period searched (§3.4)
+        int lastLag = MaxLag + Yin.ExtraLags;
+        Require(VoiceAnalyzer.WindowSamples - lastLag > MaxLag,
+            $"F0SearchMinHz of {F0SearchMinHz} Hz is too low for the 2048-sample window; the YIN integration window would be shorter than the longest period.");
+    }
+
+    private static void Finite(float value, string name)
+    {
+        if (!float.IsFinite(value))
+            throw new ArgumentException($"{name} must be a finite number, was {value}.");
+    }
+
+    private static void Require(bool condition, string message)
+    {
+        if (!condition)
+            throw new ArgumentException(message);
     }
 }

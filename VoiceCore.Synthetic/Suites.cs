@@ -127,8 +127,9 @@ public static class Suites
     /// directions. F0Hz must match the true f0 at WindowCenterSample within ±5
     /// cents per frame, and the mean error must be within ±1 cent (the bias an
     /// off-center window would cause). For harmonic complexes the per-frame
-    /// tolerance adds the glide's change over half a period (spec §3.4 note):
-    /// a pulse-like signal only pins timing to within its pulse spacing.
+    /// tolerance adds the glide's change over half a period (spec §3.4 v2.4): that
+    /// is this estimator's measured scatter on pulse-like signals, and it's a
+    /// provisional allowance.
     /// <see cref="ErrorSummary.CentsPerPeriodMsSlope"/> exposes any trend in error
     /// vs period.
     /// </summary>

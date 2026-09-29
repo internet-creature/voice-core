@@ -76,8 +76,8 @@ public sealed class VoiceAnalyzer
         get => _calibratedNoiseFloorDbfs;
         set
         {
-            if (!float.IsFinite(value))
-                throw new ArgumentOutOfRangeException(nameof(value));
+            if (value is not (>= -120f and <= 0f))  // also rejects NaN
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Noise floor must be in [-120, 0] dBFS.");
             _calibratedNoiseFloorDbfs = value;
             _noiseFloorDbfs = value;
         }

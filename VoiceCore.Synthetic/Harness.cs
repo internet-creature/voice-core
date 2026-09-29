@@ -194,9 +194,11 @@ public static class Harness
 
     /// <summary>
     /// Per-frame cents tolerance. With <see cref="CaseExpectation.AllowPulseTiming"/>,
-    /// adds the glide's change over half a period: in a pulse-like signal the pitch
-    /// information sits at the pulses, so the moment an estimate describes can sit up
-    /// to half a period from the window center. Zero for steady tones.
+    /// adds the glide's change over half a period. That matches the measured
+    /// frame-to-frame scatter of this YIN on pulse-like signals during fast glides,
+    /// where the moment each estimate describes wanders by up to about half a period.
+    /// It's a provisional allowance for this estimator, not a limit on f0 estimation
+    /// in general. Zero for steady tones.
     /// </summary>
     public static double Tolerance(double baseCents, FrameTruth t, CaseExpectation expect)
     {
@@ -221,7 +223,9 @@ public sealed record CaseExpectation
     /// <summary>
     /// Widen the per-frame tolerance on glides by the pitch change over half a period
     /// (see <see cref="Harness.Tolerance"/>). For pulse-like (harmonic-rich) signals,
-    /// where per-frame timing is only defined to within the pulse spacing.
+    /// where this estimator's per-frame timing scatters by up to about half a period.
+    /// Always pair it with <see cref="MaxMeanCents"/> and a slope check, which still
+    /// catch any systematic timing bias.
     /// </summary>
     public bool AllowPulseTiming { get; init; }
     public bool NoOctaveErrors { get; init; } = true;

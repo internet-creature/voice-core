@@ -205,21 +205,27 @@ the analysis chain has a hard latency floor — YIN needs 2–3 periods of audio
 
 so: **sustained lines, glides, and contours.** no tight timing windows, no discrete note-hits with millisecond judgment. the highway is something you trace, not something you strike. scoring compensates for the measured latency offset (calibration parameter) so the trace is *judged* against where the voice actually was, even though it *renders* late.
 
-**latency calibration is per player, and it's two offsets (v2.4).** end-to-end latency varies a lot by setup. a 144 Hz monitor adds ~10 ms, and a TV outside game mode can add 50–100+ ms. a USB mic adds a few ms, and Bluetooth 150–250 ms each way. the phase 0 baseline on a desktop with a USB mic was an 80 ms audio round trip (analyzer spec §8 step 3). scoring needs two different sums:
+**latency calibration is per player, and it's two offsets (v2.4).** end-to-end latency varies a lot by setup. a 144 Hz monitor adds ~10 ms, and a TV outside game mode can add 50–100+ ms. a USB mic adds a few ms, and Bluetooth 150–250 ms each way. the phase 0 baseline on a desktop with a USB mic was an 80 ms audio round trip (analyzer spec §8 step 3). scoring needs two different offsets:
 
-- **visual sync = display + mic input.** the player sings to targets they see. this is always needed.
-- **audio sync = speaker/headphone output + mic input.** only needed if the game plays reference tones (part 4).
+- **visual sync:** the player sings to targets they see. this is always needed.
+- **audio sync:** only needed if the game plays reference tones (part 4).
 
-each sum is measured directly, with no need to split it into parts:
+**what the sync test measures (revised after Sol's review).** a marker sweeps across the screen, and the player says "pa" each time it crosses a line. the audio version is the same with beeps. the measured gap is **not a hardware latency**. it's hardware (display or output, plus mic input) plus the player's own timing: how far they anticipate or trail a beat, and how their onset is produced. a median over repetitions removes scatter, not that consistent personal offset. so the result is a **personal scoring adjustment**, and it's documented, stored and validated as one:
 
-- **the test.** a marker sweeps across the screen, and the player says "pa" each time it crosses a line. the measured offset is the gap between the crossing and the voice onset. the audio version is the same with beeps. use the voice, not a clap or a key: it's the input the game scores, and "pa" has a sharp onset. take 8–16 repetitions and use the median, since people anticipate beats.
-- **storage.** offsets are stored per input/output device combination, so plugging in a headset doesn't silently invalidate them.
-- **manual nudge.** a slider lets players who feel it's off adjust it, as rhythm games do.
-- **Bluetooth warning.** its latency is large and can drift, so onboarding recommends a wired or USB mic.
+- **why it's still the right thing to score with:** grading asks whether the voice matched the target *as the player experienced it*. a consistent personal lead or lag is part of how this player traces the line, the same way rhythm games' calibration absorbs player habit along with hardware. for a tracing game with sustained lines that's fair. it doesn't paper over a skill the game teaches.
+- **how it's measured:** the onset is detected from the level jump of the "p" burst, not from pitch. voicing in "pa" begins tens of milliseconds after the burst, and that gap varies by speaker. use 8–16 repetitions and take the median.
+- **storage:** offsets are stored per player and per input/output device combination, so plugging in a headset doesn't silently invalidate them.
+- **manual nudge:** a slider lets players who feel it's off adjust it, as rhythm games do.
+- **Bluetooth warning:** its latency is large and can drift, so onboarding recommends a wired or USB mic.
+- **where it helps, hardware can be measured separately:** e.g. an automatic loopback with headphones held to the mic for the audio path. the UI then shows the adjustment as "hardware ~X ms + your timing ~Y ms", so a strange personal component is visible instead of hidden.
 
 calibration fixes *scoring*, not *feel*. the pitch line is drawn at the moment the voice actually happened, so it lines up with the target, but the perceived lag of ~50–100 ms can only be reduced, not calibrated away. that's the reason this is a tracing game.
 
-**validation:** on the developer's machine, the in-game voice test must agree with the camera test (analyzer spec §3.1) within a few milliseconds. the camera test is ground truth; the voice test is what every other player gets.
+**validation:** the voice test can't be checked against the camera test within a few milliseconds, because the camera measures hardware only (mouth to screen) and the voice test adds the player. validate it as a personal adjustment instead:
+
+- **repeatability:** the same player on the same setup should get the same offset across sessions, within a tolerance set from playtest data. if it wanders, it isn't stable enough to score with.
+- **decomposition on the developer's machine:** the voice-test offset minus the camera's hardware latency is the personal component. it should be plausible (a few tens of ms) and stable across sessions.
+- **fairness check in playtest:** grade the same runs with and without the adjustment, and ask players which grading matched what they felt they did.
 
 ## 1.8 the highway
 
@@ -297,7 +303,7 @@ these thresholds are **product requirements and live in this document**. the ana
 ### 1a — integration and calibration
 
 - **capture path decision** (new in v2): evaluate native in-process capture (PortAudioSharp, as in VoiceProbe) against Godot's `AudioEffectCapture` before committing. `AudioEffectCapture` routes through Godot's audio server (extra buffering, less control over device format, possible OS-processed stream); VoiceCore doesn't care where buffers come from, so use whichever path measures better on latency and rawness. (v2.3: VoiceProbe is now a Godot project, so this comparison starts in phase 0 at analyzer build step 3. 1a confirms the choice rather than starting it.)
-- **onboarding flow**: device selection, input gain, noise floor measurement, latency calibration (the voice-onset sync test from §1.7: visual sync always, audio sync if reference tones ship; manual nudge available)
+- **onboarding flow**: device selection, input gain, noise floor measurement, latency calibration (the voice-onset sync test from §1.7, a personal scoring adjustment: visual sync always, audio sync if reference tones ship; manual nudge available)
 - **baseline voice assessment**: comfortable speaking f0, range floor and ceiling, resonance baseline, one read passage
 - assessment output writes **observed range and the safe-range gate only** (v2.2 — measurement, not goals). goal bands are *chosen by the user* in a separate onboarding step: the UI may offer starting suggestions relative to the observed range, but the user places and confirms them, may skip entirely, and **goal-band editing ships in the MVP**. this keeps the analyzer-spec rule intact: goals are user-chosen, editable, and default to nothing.
 
@@ -463,7 +469,7 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 
 **v2.4 (2026-09-29, paired with analyzer spec v2.4):**
 
-- **latency calibration** (§1.7, 1a): it's per player and per device combination, and it's two offsets: visual sync (display + mic, always) and audio sync (output + mic, only with reference tones). both are measured directly by a voice-onset sync test ("pa" on a visual or audible beat, median of 8–16), with a manual nudge and a Bluetooth warning. the camera test validates the in-game test on the developer's machine. this replaces "loopback or manual tap-to-sync".
+- **latency calibration** (§1.7, 1a): it's per player and per device combination, and it's two offsets: visual sync (always) and audio sync (only with reference tones). a voice-onset sync test measures each one ("pa" on a visual or audible beat, detected from the burst's level onset, median of 8–16). per Sol's review, the result is a **personal scoring adjustment**: hardware plus the player's own timing, not a hardware latency. it's validated by repeatability, by decomposition against the camera test on the developer's machine, and by a playtest fairness check, not by millisecond agreement with the camera. a hardware part can be measured separately where possible and shown alongside. manual nudge and Bluetooth warning included. this replaces "loopback or manual tap-to-sync".
 
 **v2.3 (2026-09-28, paired with analyzer spec v2.3):**
 

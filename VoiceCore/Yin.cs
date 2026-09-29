@@ -51,7 +51,7 @@ internal readonly record struct F0Candidate(float F0Hz, float Aperiodicity, F0Ra
 internal sealed class Yin
 {
     private const int FirstLag = 2;
-    private const int ExtraLags = 24;
+    internal const int ExtraLags = 24;
     private const double SmoothingFraction = 0.015;
 
     /// <summary>How far below the floor (in cents) a refined minimum must be to count as below range.</summary>
