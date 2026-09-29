@@ -262,23 +262,13 @@ public class LiveAnalysisPumpTests
         var rig = new Rig();
         var chunk = TestSignals.Busy(256);
         var dest = new AnalysisFrame[rig.Frames.Capacity];
-        for (int i = 0; i < 100; i++)
+        Allocation.AssertSteadyStateFree(() =>
         {
             rig.Audio.Write(chunk);
             rig.Pump.PumpOnce();
             rig.Frames.Drain(dest, out _);
             rig.Latest.TryGetLatest(out _);
-        }
-
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 2000; i++)
-        {
-            rig.Audio.Write(chunk);
-            rig.Pump.PumpOnce();
-            rig.Frames.Drain(dest, out _);
-            rig.Latest.TryGetLatest(out _);
-        }
-        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        });
     }
 
     [Fact]

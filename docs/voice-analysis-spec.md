@@ -43,6 +43,16 @@ VoiceProbe/          minimal Godot 4 C# project
   - live mic capture, live pitch trace, frame logging
   - disposable. do not put logic here.
 
+VoiceProbe.Capture/  class library the probe uses (build step 3)
+  - PortAudio capture, device format policy + 44.1→48 kHz resampler (§3),
+    loopback latency test, session log
+  - no Godot dependency, so it's unit-testable; VoiceCore still never
+    references it
+
+VoiceCore.Synthetic/ test tooling (build step 2)
+  - synthetic signals with exact ground truth, the §3.4 suites, and the
+    harness that scores frames against them. never ships.
+
 VoiceCore.Tests/     xUnit
 ```
 
@@ -95,7 +105,7 @@ public sealed class VoiceAnalyzer
 
 | package | project | license |
 |---|---|---|
-| PortAudioSharp2 | VoiceProbe | MIT |
+| PortAudioSharp2 | VoiceProbe.Capture | MIT |
 | FftSharp | VoiceCore | MIT |
 | Parquet.Net | VoiceCore.Batch | Apache-2.0 |
 | Godot 4 (.NET) | VoiceProbe | MIT |

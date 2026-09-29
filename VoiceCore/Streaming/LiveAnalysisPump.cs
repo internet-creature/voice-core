@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace VoiceCore.Streaming;
 
 /// <summary>
@@ -21,6 +23,8 @@ public sealed class LiveAnalysisPump : IDisposable
     private readonly VoiceAnalyzer _analyzer;
     private readonly FrameQueue _frames;
     private readonly TripleBuffer<AnalysisFrame> _latest;
+    private readonly ArrivalLog? _arrivals;
+    private readonly CaptureGapLog? _gaps;
     private readonly float[] _chunk = new float[MaxBacklogSamples];
     private readonly AnalysisFrame[] _frameScratch = new AnalysisFrame[VoiceAnalyzer.MaxFramesFor(MaxBacklogSamples)];
 
@@ -35,11 +39,21 @@ public sealed class LiveAnalysisPump : IDisposable
     /// Starts analysis at the ring's current write position; audio already in the
     /// ring is ignored.
     /// </summary>
+    /// <param name="arrivals">
+    /// Where the capture callback logs its writes. When given, every frame's
+    /// capture-to-result latency is recorded in <see cref="AnalyzerDiagnostics"/>.
+    /// </param>
+    /// <param name="gaps">
+    /// Where the capture callback marks discontinuities (e.g. driver input
+    /// overflow). The analyzer is reset exactly at each one.
+    /// </param>
     public LiveAnalysisPump(
         SpscOverwriteRing<float> audio,
         VoiceAnalyzer analyzer,
         FrameQueue frames,
-        TripleBuffer<AnalysisFrame> latest)
+        TripleBuffer<AnalysisFrame> latest,
+        ArrivalLog? arrivals = null,
+        CaptureGapLog? gaps = null)
     {
         if (audio.Capacity <= MaxBacklogSamples)
             throw new ArgumentException($"Audio ring must hold more than {MaxBacklogSamples} samples.", nameof(audio));
@@ -49,6 +63,8 @@ public sealed class LiveAnalysisPump : IDisposable
         _analyzer = analyzer;
         _frames = frames;
         _latest = latest;
+        _arrivals = arrivals;
+        _gaps = gaps;
         _position = audio.PublishedIndex;
         analyzer.Reset(_position);
     }
@@ -72,7 +88,23 @@ public sealed class LiveAnalysisPump : IDisposable
                 continue;
             }
 
-            var chunk = _chunk.AsSpan(0, (int)Math.Min(target - _position, _chunk.Length));
+            long chunkEnd = Math.Min(target, _position + _chunk.Length);
+            if (_gaps is not null)
+            {
+                bool hasGap = _gaps.TryPeek(_position, out long gap, out bool lost);
+                if (lost)
+                    ResetAtGap(_position);  // gap records were overwritten: assume one here
+                if (hasGap && gap == _position)
+                {
+                    ResetAtGap(gap);
+                    _gaps.Consume();
+                    continue;
+                }
+                if (hasGap && gap < chunkEnd)
+                    chunkEnd = gap;  // analyze up to the gap, reset, then go on
+            }
+
+            var chunk = _chunk.AsSpan(0, (int)(chunkEnd - _position));
             if (!_audio.TryCopy(_position, chunk))
             {
                 target = DropBacklog(_audio.PublishedIndex);
@@ -85,6 +117,7 @@ public sealed class LiveAnalysisPump : IDisposable
             {
                 _frames.Enqueue(_frameScratch.AsSpan(0, produced));
                 _latest.Publish(in _frameScratch[produced - 1]);
+                RecordCaptureToResult(produced);
                 total += produced;
             }
             AfterChunk?.Invoke();
@@ -124,6 +157,30 @@ public sealed class LiveAnalysisPump : IDisposable
             if (_position == before)
                 Thread.Sleep(1);
         }
+    }
+
+    /// <summary>
+    /// Frames are readable now; latency runs from the arrival of the last sample
+    /// each one depends on (spec §3.1).
+    /// </summary>
+    private void RecordCaptureToResult(int produced)
+    {
+        if (_arrivals is null)
+            return;
+        long now = Stopwatch.GetTimestamp();
+        for (int i = 0; i < produced; i++)
+        {
+            if (_arrivals.TryGetArrival(_frameScratch[i].ResultAvailableSample - 1, out long arrived))
+                _analyzer.Diagnostics.RecordCaptureToResult(now - arrived);
+            else
+                _analyzer.Diagnostics.RecordCaptureToResultMissed();
+        }
+    }
+
+    private void ResetAtGap(long sampleIndex)
+    {
+        _analyzer.Reset(sampleIndex);
+        _analyzer.Diagnostics.RecordCaptureGap();
     }
 
     /// <summary>Returns the new pump target: the published index it dropped against.</summary>

@@ -1,0 +1,13 @@
+<Project Sdk="Godot.NET.Sdk/4.7.2">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VoiceCore\VoiceCore.csproj" />
+    <ProjectReference Include="..\VoiceProbe.Capture\VoiceProbe.Capture.csproj" />
+  </ItemGroup>
+</Project>

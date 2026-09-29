@@ -21,6 +21,7 @@
   <ItemGroup>
     <ProjectReference Include="..\VoiceCore\VoiceCore.csproj" />
     <ProjectReference Include="..\VoiceCore.Synthetic\VoiceCore.Synthetic.csproj" />
+    <ProjectReference Include="..\VoiceProbe.Capture\VoiceProbe.Capture.csproj" />
   </ItemGroup>
 
 </Project>
