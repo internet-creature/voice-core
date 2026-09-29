@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="VoiceCore.Batch/VoiceCore.Batch.csproj" />
+  <Project Path="VoiceCore.Tests/VoiceCore.Tests.csproj" />
+  <Project Path="VoiceCore/VoiceCore.csproj" />
+</Solution>
