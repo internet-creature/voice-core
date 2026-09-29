@@ -131,7 +131,7 @@ public static class Harness
     /// <see cref="CaseExpectation.SettleSeconds"/> into their segment, are not
     /// scored. Per-frame rules by true range (spec §3.4):
     /// <list type="bullet">
-    /// <item>In: must be Voiced if required, within the cents tolerance if set, and never a gross error if octave errors are banned.</item>
+    /// <item>In: must be Voiced if required; a Voiced frame must publish a finite, positive F0Hz; then within the cents tolerance if set, and never a gross error if octave errors are banned.</item>
     /// <item>Above: <c>F0Range = Above</c> with <c>F0Hz</c> NaN. Never a folded value.</item>
     /// <item>Below: <c>F0Range = Below</c>, not Voiced, <c>F0Hz</c> NaN, or F0Confidence below the floor.</item>
     /// <item>Straddling the range edge: may abstain, but a published F0Hz must not be a gross error.</item>
@@ -152,6 +152,10 @@ public static class Harness
             {
                 TruthRange.In when expect.RequireVoiced && f.Voicing != VoicingState.Voiced
                     => $"expected Voiced, got {f.Voicing}",
+                // checked before the error rules: NaN is neither a gross error nor
+                // out of tolerance, so without this a pitchless frame could pass
+                TruthRange.In when f.Voicing == VoicingState.Voiced && !(float.IsFinite(f.F0Hz) && f.F0Hz > 0)
+                    => $"no pitch published: Voiced with F0Hz = {f.F0Hz}",
                 TruthRange.In when expect.MaxAbsCents is { } tol && !(Math.Abs(t.CentsError) <= tol)
                     => $"error {t.CentsError:+0.0;-0.0} cents exceeds ±{tol}",
                 TruthRange.In when expect.NoOctaveErrors && t.IsGrossError

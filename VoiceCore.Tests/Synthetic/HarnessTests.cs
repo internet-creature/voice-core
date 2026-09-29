@@ -63,6 +63,25 @@ public class HarnessTests
         Assert.Equal(result.ScoredFrames, result.Errors.OctaveErrors);
     }
 
+    [Theory]
+    [InlineData("sweep/voice/250.6Hz/-20dBFS/phase1/snr20", float.NaN)]  // no cents tolerance
+    [InlineData("breathy/200Hz/hnr5/phase0", float.NaN)]                  // no cents tolerance
+    [InlineData("smoke/sine/200Hz", float.NaN)]
+    [InlineData("breathy/200Hz/hnr5/phase0", 0f)]
+    [InlineData("breathy/200Hz/hnr5/phase0", float.PositiveInfinity)]
+    public void VoicedFramesWithoutAPitchFail(string caseName, float published)
+    {
+        // regression (Sol review): Voiced with F0Hz = NaN used to pass cases that
+        // have no cents tolerance, since NaN is neither a gross error nor out of tolerance
+        var c = Suites.Find(caseName);
+        var noPitch = Oracle(c.Build(), t => Perfect(t) with { F0Hz = published });
+
+        var result = Harness.Evaluate(noPitch, c.Expect);
+        Assert.False(result.Passed);
+        Assert.Equal(result.ScoredFrames, result.Failures.Count);
+        Assert.Contains("no pitch", result.Failures[0]);
+    }
+
     [Fact]
     public void MissingVoicingFails()
     {
