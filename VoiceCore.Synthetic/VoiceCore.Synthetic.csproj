@@ -2,11 +2,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\VoiceCore\VoiceCore.csproj" />
-    <ProjectReference Include="..\VoiceCore.Synthetic\VoiceCore.Synthetic.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
