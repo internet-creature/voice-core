@@ -1,8 +1,8 @@
-# voice analysis prototype — technical spec v2
+# voice analysis prototype — technical spec v2.3
 
 phase 0 deliverable. the goal is not a game. the goal is to answer "is the tracking good enough to build on?" with numbers, before any engine work happens.
 
-v2 incorporates the Sol review plus a second pass. changes from v1 are summarized at the end (§12).
+v2 incorporates the Sol review plus a second pass. v2.3 applies a fresh-eyes review done before any code was written: a breathy voicing path, a fixed-window YIN difference function, calibrated confidence, a frame queue, a precise capture-to-result definition, and resonance cross-talk validation. changes from v1 are summarized at the end (§9).
 
 ---
 
@@ -30,7 +30,7 @@ this is an architectural rule, not a tone note. it keeps the analyzer testable a
 three projects. the split matters more than anything else in this doc.
 
 ```
-VoiceCore/           net8.0 class library
+VoiceCore/           class library (see TFM note below)
   - zero UI, zero audio-device code, zero platform deps
   - stateful streaming analyzer: push samples in, frames come out
   - this is the assembly Godot will reference later, unchanged
@@ -39,14 +39,22 @@ VoiceCore.Batch/     console app
   - runs VoiceCore over a corpus of WAVs *through the same streaming path*
   - emits per-frame Parquet + summary CSV
 
-VoiceProbe/          Avalonia app
-  - live mic capture, minimal render, frame logging
+VoiceProbe/          minimal Godot 4 C# project
+  - live mic capture, live pitch trace, frame logging
   - disposable. do not put logic here.
 
 VoiceCore.Tests/     xUnit
 ```
 
-**VoiceCore must never know what a microphone is.** it takes buffers. the probe and the game both feed it.
+**VoiceCore must never know what a microphone is.** it takes buffers. the probe and the game both feed it. that isolation is enforced by VoiceCore being its own assembly with no engine or device references. the probe's host framework doesn't affect it.
+
+**why the probe is Godot (v2.3, was Avalonia):** the probe is disposable either way. but a Godot probe also:
+
+- gets the HDR glow the game will need, so step 8's legibility test runs in the real renderer
+- lets the phase 1a capture comparison (native PortAudio vs `AudioEffectCapture`) start in phase 0
+- means one less UI framework to learn and then throw away
+
+**TFM (v2.3):** .NET 8 LTS goes out of support in November 2026. target whatever the current Godot release supports for C# projects, preferring .NET 10 LTS. VoiceCore has no framework-specific dependencies, so multi-targeting is cheap if needed.
 
 ### 1.1 the analyzer contract
 
@@ -65,8 +73,14 @@ public sealed class VoiceAnalyzer
     /// adaptation). call on stream start and after any capture gap.
     public void Reset(long nextSampleIndex = 0);
 
+    /// upper bound on frames one Process call can emit for an input of
+    /// this length: inputLength / HopSamples + 1.
+    public static int MaxFramesFor(int inputLength);
+
     /// consumes input, writes any completed frames to output,
     /// returns the number written. zero-allocation in steady state.
+    /// output.Length must be >= MaxFramesFor(input.Length); a smaller
+    /// span throws ArgumentException (a caller bug, not a runtime state).
     public int Process(ReadOnlySpan<float> input, Span<AnalysisFrame> output);
 
     public AnalyzerDiagnostics Diagnostics { get; }  // counters, see §2
@@ -81,13 +95,14 @@ public sealed class VoiceAnalyzer
 
 | package | project | license |
 |---|---|---|
-| PortAudioSharp2 (or NAudio if Windows-only) | VoiceProbe | MIT |
+| PortAudioSharp2 | VoiceProbe | MIT |
 | FftSharp | VoiceCore | MIT |
-| MathNet.Numerics (eigenvalues for LPC roots) | VoiceCore | MIT |
 | Parquet.Net | VoiceCore.Batch | Apache-2.0 |
-| Avalonia + SkiaSharp | VoiceProbe | MIT |
+| Godot 4 (.NET) | VoiceProbe | MIT |
 
-all permissive. caveat: FftSharp's public API allocates per call. either wrap it with pooled buffers behind an internal `IFftPlan` interface, or hand-roll the real FFT (~100 lines). the interface also keeps the door open to dropping MathNet (Bairstow's method) if we want VoiceCore dependency-free before shipping.
+all permissive. caveat: FftSharp's public API allocates per call. either wrap it with pooled buffers behind an internal `IFftPlan` interface, or hand-roll the real FFT (~100 lines).
+
+**LPC root finding is hand-rolled (v2.3).** v2 listed MathNet.Numerics for companion-matrix eigenvalues. its eigen solver allocates on every call, which breaks the zero-allocation contract in §1.1. the polynomial is at most order 18 (`maxFormantHz` = 8000), so a small solver on preallocated buffers is enough: Hessenberg QR on the companion matrix, or Aberth–Ehrlich on the polynomial. MathNet may stay in `VoiceCore.Tests` as the reference to check roots against.
 
 ---
 
@@ -97,9 +112,13 @@ all permissive. caveat: FftSharp's public API allocates per call. either wrap it
 capture callback (realtime thread)
     └─> lock-free SPSC ring buffer (2^17 floats ≈ 2.7 s @ 48 kHz)
             └─> analysis thread (dedicated, not thread pool)
+                    ├─> SPSC frame queue (every frame, 256 slots ≈ 2.5 s)
+                    │       └─> trace renderer, scoring, logging
                     └─> triple-buffered latest AnalysisFrame
-                            └─> UI thread reads without locking
+                            └─> meters/needles read without locking
 ```
+
+**every frame reaches its consumers (v2.3).** v2 only had the triple buffer, which is right for a needle meter but drops frames by design: 100 frames/s against a 60 fps render. a pitch trace needs every frame, or it misses short events and draws a subsampled line. scoring needs every frame, or grades depend on render timing. so the frame queue is the primary output, and the triple buffer is a convenience for "what's the value right now" displays. if the queue overflows because the consumer stalls, drop the oldest frames and increment `Diagnostics.FrameQueueOverruns`. the consumer treats the gap like a capture gap: it scores nothing across it.
 
 rules for the capture callback: no allocation, no locking, no logging. write and return.
 
@@ -113,7 +132,7 @@ ring buffer: power-of-two size, `Interlocked` read/write indices, mask instead o
 
 batch mode never drops; it just runs slower than realtime.
 
-`AnalyzerDiagnostics`: overrun count, dropped samples, frames produced, max analysis time per frame. logged per session; overruns > 0 on target hardware is a bug.
+`AnalyzerDiagnostics`: overrun count, dropped samples, frame-queue overruns, frames produced, max analysis time per frame. logged per session; overruns > 0 on target hardware is a bug.
 
 ---
 
@@ -135,7 +154,7 @@ every frame carries two timestamps:
 derived definitions, used consistently everywhere:
 
 - **algorithmic delay** = `ResultAvailableSample − WindowCenterSample`. for the 2048-sample YIN window: 1024 samples ≈ 21.3 ms, plus the FIR group delays in the formant path (compensated in timestamps, see §3.6).
-- **capture-to-result latency** = wall-clock from a sample entering the ring buffer to its frame being readable by the UI thread. measured, includes scheduling and analysis time.
+- **capture-to-result latency** = wall-clock from the arrival in the ring buffer of the **last sample the frame depends on** (the sample at `ResultAvailableSample`) to the frame being readable by its consumers. this is analysis compute plus thread scheduling. it does not include algorithmic delay, which is a fixed constant per config and is reported separately. (v2.3: v2 said "a sample … its frame." measured from the window center, the same frame reads ~21 ms slower than measured from its last sample, and Gate B's threshold sat right in that gap.)
 - **user-to-photon latency** = mouth to pixels. includes device/driver buffering, capture-to-result, render queuing, and display scanout. **only measurable end-to-end** — an audio loopback test does not capture the render half. measure with a clap-to-screen-flash camera test (240 fps phone camera is sufficient).
 
 v1's latency table mixed these. the budget in §5 uses the definitions above.
@@ -164,18 +183,51 @@ v1 had a contradiction: the voiced gate required aperiodicity < 0.20, but creak 
    the candidate is always logged. it is *published* as F0Hz only when
    step 3 lands on Voiced.
 
-3. CLASSIFY on {aperiodicity, ZCR, level, temporal evidence}:
-     aperiodicity < 0.20                      → Voiced
-     0.20 ≤ aperiodicity < 0.45, low ZCR      → Creak candidate
-     else                                      → Unvoiced
+3. CLASSIFY on {aperiodicity, f0 stability, ZCR, temporal evidence}:
+     aperiodicity < 0.20                                → Voiced
+     0.20 ≤ aperiodicity < 0.45, f0 candidate STABLE    → Voiced (breathy path)
+     0.20 ≤ aperiodicity < 0.45, not STABLE, low ZCR    → Creak candidate
+     else                                                → Unvoiced
+
+   BREATHY PATH (new in v2.3). breathy phonation is a periodic source plus
+   aspiration noise, so its aperiodicity can sit well above 0.20. it is
+   also sustained, so v2's rules would have filed it as Creak (3 of 5
+   frames) or Unvoiced. that blanks the pitch line during a core practice
+   mode, the same case the +8 dB level gate was lowered for. what separates
+   breathy voice from creak is that its period stays steady:
+     STABLE = f0RawHz within ±50 cents of the median of the previous 3
+     non-silent candidates, all inside the search range. (tolerates
+     glides up to ~2500 cents/s.)
+   breathy-path frames publish as Voiced with F0Confidence lowered by
+   their aperiodicity (§3.9). a frame at onset has no candidate history,
+   so it can't be STABLE. a breathy onset therefore publishes Unvoiced for
+   ~30 ms, about the same delay as creak's multi-frame rule.
+
+   ZCR = sign changes per second over the current hop, on the DC-removed
+   48 kHz signal. "low" defaults to < 2000/s, a starting guess to be tuned
+   on the corpus.
+
    CREAK IS A MULTI-FRAME CALL, not a single-frame threshold: a creak
    candidate is published as Creak only when ≥3 of the last 5 non-silent
-   frames are creak candidates (subharmonic evidence — d′(2τ) competitive
-   with d′(τ) — counts as a candidate too, since creak often presents as
-   period doubling rather than raw aperiodicity). until then it is
-   published as Unvoiced with the candidate logged.
+   frames are creak candidates. until then it is published as Unvoiced
+   with the candidate logged.
+
+   SUBHARMONIC EVIDENCE (corrected in v2.3). v2 counted "d′(2τ)
+   competitive with d′(τ)" as creak evidence. but for any clean periodic
+   signal d′(2τ) ≈ d′(τ) ≈ 0, so that test fires on ordinary voiced
+   speech. period doubling (alternate cycles differ) does show up as a
+   moderate d′ dip at half the best lag. a modal voice with a strong 2nd
+   harmonic produces the same dip, and within one frame the two look
+   identical. only context separates them: the best lag just doubled
+   against recent history, f0 was falling, level or CPP is low. subharmonic
+   evidence is logged but not used in classification until step 6 designs
+   a rule and validates it against the hand-labeled creak subset.
+
    hysteresis: leaving Voiced or Creak requires 2 consecutive frames of
    contrary evidence, so single-frame flicker doesn't strobe the display.
+   during a hold (contrary evidence while the state stays Voiced), F0Hz
+   publishes that frame's own candidate with its lowered confidence, and
+   the display track keeps its last value instead of updating.
 
 4. PUBLISH. F0Hz = NaN unless Voiced. Creak frames report Creak honestly —
    never a bogus 55 Hz. that's a lie the user will catch, and it destroys
@@ -186,39 +238,44 @@ output: `Silence | Unvoiced | Voiced | Creak` plus a 0..1 voicing confidence.
 
 all thresholds above are config values with these defaults, and the whole classifier is scored against hand labels (§6). expect to retune.
 
-note on creak coverage: creak periods are often longer than the 60 Hz search floor can represent, so the detector deliberately does not require a valid f0 — it keys on aperiodicity, subharmonics, and temporal evidence. the pulse-based detector (phase 1) will do better; this one just has to be honest.
+note on creak coverage: creak periods are often longer than the 60 Hz search floor can represent, so the detector deliberately does not require a valid f0. it keys on aperiodicity, f0-candidate instability, and temporal evidence. the pulse-based detector (phase 1) will do better; this one just has to be honest.
 
 descending glides and the bottom of range generate a lot of creak in practice sessions — for transfem users especially, but the adversarial corpus tasks make it everyone's code path. treat creak as high-traffic, and measure how often it occurs per task in the corpus rather than assuming.
 
 ### 3.4 f0 — YIN-FFT
 
-- window **2048 samples** (42.7 ms @ 48 kHz), timestamped at center
-- search range **60–600 Hz** → lag τ from 80 to 800 samples
-- **exact difference function** (this is where FFT shortcuts go wrong):
+- buffer **2048 samples** (42.7 ms @ 48 kHz), timestamped at center
+- search range **60–1000 Hz** → lag τ from 48 to 800 samples. (v2.3: v2 capped the range at 600 Hz, but warm-up sirens go above that for many voices and the trace would drop out at the top. the safe-range gate should limit what charts ask for, not the tracker. a higher ceiling adds octave-up candidates for every voice, so the sweep suite adds octave-up bait (below). if the corpus shows more octave-up errors at the higher ceiling, fall back to per-exercise ceilings: 600 Hz for speech charts, 1000 Hz for sirens. configs are immutable, so the game builds one analyzer per exercise type.)
+- **exact difference function, fixed integration window** (this is where FFT shortcuts go wrong):
 
   ```
-  d(τ) = Σ_{j=0}^{W−τ−1} (x[j] − x[j+τ])²
-       = E_head(W−τ) + E_tail(τ) − 2·R(τ)
+  buffer B = 2048, max lag τmax = 800, integration length W = B − τmax = 1248
+  (26 ms — longer than the longest period searched, 16.7 ms at 60 Hz)
 
-  E_head(m) = Σ_{j=0}^{m−1} x[j]²          (one cumulative-sum array
-  E_tail(τ) = Σ_{j=τ}^{W−1} x[j]²           serves both)
-  R(τ)      = Σ_{j=0}^{W−τ−1} x[j]·x[j+τ]
+  d(τ) = Σ_{j=0}^{W−1} (x[j] − x[j+τ])²        for τ = 0..τmax
+       = E(0, W) + E(τ, τ+W) − 2·R(τ)
+
+  E(a, b) = Σ_{j=a}^{b−1} x[j]²     (one cumulative-sum array serves every τ)
+  R(τ)    = Σ_{j=0}^{W−1} x[j]·x[j+τ]
   ```
 
-  R(τ) via FFT: zero-pad the 2048-sample window to **4096** (≥ 2W, prevents circular wraparound), forward FFT, multiply by conjugate, inverse FFT. the naive `2(R(0) − R(τ))` form is biased at large lags because window energy changes with lag — use the three-term form above.
+  R(τ) via FFT: cross-correlate the first W samples against the whole buffer. zero-pad both to **4096** (≥ B + W − 1 = 3295, so no circular wraparound) and compute `IFFT(conj(FFT(head)) · FFT(buffer))`. the naive `2(R(0) − R(τ))` form is biased because window energy changes with lag. use the three-term form above.
+
+  **why a fixed window (v2.3):** v2 summed over `2048 − τ` terms, so d(τ) shrank at longer lags just because it had fewer terms. the YIN paper (de Cheveigné & Kawahara 2002) uses a fixed integration window to avoid exactly this. the shrinking sum favors long lags, which means octave-down errors. that bias only matters where 2τ fits inside the search range (f0 above ~120 Hz), so it lands on higher voices. it bites hardest when no dip clears the 0.15 threshold (breathy or noisy frames) and the global-minimum fallback decides.
 
 - cumulative mean normalized difference `d′(τ) = d(τ)·τ / Σ_{j=1..τ} d(j)`, `d′(0) = 1`
 - absolute threshold 0.15 — take the **first** local minimum below it; if none, take the global minimum and mark low confidence
 - parabolic interpolation over the three points around the minimum for sub-sample lag
 - output `f0RawHz` (always, per §3.3), and `f0Cents = 1200 · log2(f0 / 55.0)` — fixed 55 Hz anchor so the number is stable across sessions
 
-do the FFT version, not naive YIN. naive is ~1.5 M ops per hop; the FFT version is roughly 50× cheaper.
+ship the FFT version. the naive direct sum is W·τmax ≈ 1 M multiply-adds per hop (~100 M/s), and the FFT version is roughly an order of magnitude cheaper. the naive version stays useful as a **test oracle**: keep it in `VoiceCore.Tests` and assert that the FFT d(τ) matches it within float tolerance on random and synthetic buffers.
 
 **validation (replaces v1's single sine test):**
 
 - smoke test: synthesized 200 Hz sine → within ±2 cents. (demanding exactly 200.00 tests float trivia, not the algorithm.)
-- sweep suite: sines and harmonic complexes at 60–600 Hz in ~10% steps × several phases × amplitudes from −40 to −3 dBFS × with/without additive noise at 20 dB SNR. gate: ±5 cents on clean tones, no octave errors on harmonic complexes with strong 2nd harmonics.
-- endpoint tests at exactly 60 and 600 Hz, and just outside the range (55, 650 Hz → low confidence or unvoiced, never a folded wrong answer).
+- sweep suite: sines and harmonic complexes at 60–1000 Hz in ~10% steps × several phases × amplitudes from −40 to −3 dBFS × with/without additive noise at 20 dB SNR. gate: ±5 cents on clean tones, and no octave errors on harmonic complexes with strong 2nd harmonics or a weak fundamental (octave-up bait, which matters more now the ceiling is 1000 Hz).
+- breathy suite (v2.3): harmonic complexes at 150–400 Hz with steep spectral tilt plus aspiration-like noise, harmonics-to-noise ratio from 10 dB down to 0 dB. gate at HNR ≥ 5 dB: classified Voiced (via the breathy path, §3.3) once past onset, with no octave-down errors. 0–5 dB is reported but not gated, since that's where breathy phonation shades into whisper. this is the combined test for the breathy path and the fixed-window difference function.
+- endpoint tests at exactly 60 and 1000 Hz, and just outside the range (55, 1100 Hz → low confidence or unvoiced, never a folded wrong answer).
 
 ### 3.5 octave error correction
 
@@ -227,7 +284,8 @@ this is where naive implementations quietly fail. budget real time here.
 ```
 1. keep a running median of the last 5 valid f0Cents values
 2. if |cents[n] − runningMedian| is between 1100 and 1300:
-     - evaluate d′(τ/2) and d′(τ·2)
+     - evaluate d′(τ/2) and d′(τ·2), skipping any lag outside the
+       search range (τ·2 > 800 whenever f0 < 120 Hz)
      - if the alternate candidate's d′ is within 0.05 of the chosen one,
        prefer the candidate closer to the running median
 3. median filter, width 5:
@@ -254,7 +312,7 @@ frames therefore carry both `F0Hz` (published raw, post-octave-correction) and `
 - pre-emphasis `y[n] = x[n] − 0.97·x[n−1]` at `fs_a`
 - window 25 ms Hamming, hop 10 ms (same grid as everything else)
 - autocorrelation → Levinson-Durbin → LPC coefficients
-- root-find via companion-matrix eigenvalues
+- root-find with the preallocated solver (§1.2)
 - convert roots: `F = (fs_a / 2π)·|angle(z)|`, `BW = −(fs_a / π)·ln|z|`
 - keep roots with F in the accepted range, `BW < 400 Hz`, positive imaginary part; sort ascending → candidate F1..F4
 
@@ -265,6 +323,8 @@ frames therefore carry both `F0Hz` (published raw, post-octave-correction) and `
 - track birth: a provisional track must survive 3 frames before it's published — this is what stops a spurious pole from wearing the "F2" label for half a second.
 - per-formant confidence from bandwidth and track age; low-confidence formants are published with the confidence attached, so the game can choose its own floor.
 
+**high f0 degrades LPC formants (v2.3).** as f0 rises, harmonics sample the spectral envelope more sparsely, and LPC poles tend to lock onto individual harmonics instead of the resonances between them. this is the direction transfem users move as they progress, so resonance measurement gets *less* reliable as users approach their goals. formant error is therefore reported per f0 band (§6), not only per device. per-formant confidence should drop with f0 once the corpus shows how fast accuracy falls off.
+
 ### 3.7 resonance estimate
 
 - **formant dispersion**: `Df = mean(F(i+1) − F(i))` for i = 1..3, session-level, weighted toward F3/F4 (F1/F2 are vowel-dominated).
@@ -274,19 +334,40 @@ any F1/F2-based comparison is only meaningful **within a fixed vowel** — tag e
 
 ### 3.7b gameplay brightness proxy (experimental, new in v2.2)
 
-the game's resonance lane may end up driven by something more robust than live LPC formants (game doc §1.5). phase 0 therefore implements at least one cheap spectral proxy alongside them: spectral centroid over 0–4 kHz and/or a low/mid band-energy ratio (e.g. 0–1 kHz vs 1–4 kHz), computed per hop on voiced frames and published as an experimental frame field (`BrightnessProxy`). evaluated on the resonance-manipulation corpus task (§6), against formant measurements, for **direction accuracy**, **test–retest stability**, and **cross-device sensitivity**. no user-facing meaning in phase 0; the formants-vs-proxy decision is made at the game doc's Gate B.
+the game's resonance lane may end up driven by something more robust than live LPC formants (game doc §1.5). phase 0 therefore implements at least one cheap spectral proxy alongside them: spectral centroid over 0–4 kHz and/or a low/mid band-energy ratio (e.g. 0–1 kHz vs 1–4 kHz), computed per hop on voiced frames and published as an experimental frame field (`BrightnessProxy`). it is evaluated on the resonance-manipulation corpus task (§6), against formant measurements, for **direction accuracy**, **test–retest stability**, **cross-device sensitivity**, and **specificity** (below). no user-facing meaning in phase 0; the formants-vs-proxy decision is made at the game doc's Gate B.
+
+**the raw proxy is confounded with spectral tilt (v2.3).** centroid and band ratios rise whenever the spectral tilt flattens, and tilt flattens with vocal effort and with heavier, more pressed phonation. a raw brightness score therefore rewards pushing harder. that makes it a strain incentive in a product whose safety section forbids one (game doc §1.9). it also runs backwards for a common goal: lighter phonation steepens the tilt and reads *darker*. the proxy also rises with f0. so:
+
+- **specificity is a gate criterion.** the corpus gains cross-talk tasks (§6): pitch, loudness and vocal weight each varied while tract posture is held fixed. the proxy must move more for a posture contrast than for any of those. report the ratio.
+- **a tilt-normalized variant is scored alongside the raw one.** fit a least-squares line to the log-power spectrum over 100 Hz–4 kHz, subtract it, then compute the centroid or band ratio on the residual. the variant is an `AnalysisConfig` choice (configs are immutable), so batch runs the corpus once per variant and the better one survives.
+- **the fitted slope is published as `SpectralTiltDbPerKhz`** (experimental). it costs nothing once the normalization fit exists, and it is a starting input for the game's unscored weight meter (game doc §1.4).
 
 ### 3.8 voice quality (rescoped in v2)
 
 - **CPP (dB)** — *kept in phase 0*, fully specified:
   - 40 ms Hamming window on the 48 kHz signal, same 10 ms grid
   - power spectrum in dB (10·log10, floor at −120 dB) → real cepstrum via inverse FFT of the log-power spectrum
-  - peak search in quefrency `1/600 s .. 1/60 s` (aligned with the f0 contract — v1's 60–500 Hz range conflicted)
+  - peak search in quefrency `1/600 s .. 1/60 s` (v1's 60–500 Hz range conflicted with the f0 contract). v2.3 raised the f0 ceiling to 1000 Hz, but CPP stays capped at 600 Hz, because a peak near 1 ms would fall inside the low-quefrency region the regression excludes. frames with f0 > 600 Hz publish `CppDb = NaN`.
   - linear regression of cepstrum magnitude vs quefrency over `1 ms .. 16.7 ms`, excluding the first 1 ms (low-quefrency spectral-envelope region)
   - CPP = cepstral peak (dB) − regression value at the peak quefrency
   - diagnostic + creak/breathiness evidence only in phase 0; not gameplay-facing until validated against the corpus. it earns its place because it's cheap, needs no pulse tracking, and is the best single periodicity/breathiness measure available at this cost.
 - **H1–H2**: **deferred to phase 1.** uncorrected H1–H2 is confounded by F1 proximity, window leakage, and mic response; the ±10% harmonic search also collides with neighboring harmonics at higher f0. when it returns, it returns with Iseli–Alwan formant correction and stays diagnostic.
 - **jitter / shimmer: removed from phase 0.** differences between overlapping YIN frame estimates measure estimator movement, vibrato, and glides — not cycle-to-cycle perturbation. real jitter/shimmer need pulse-synchronous period and amplitude extraction (phase 1, alongside the pulse-based creak detector). nothing in phase 0 may consume these values, which is why the creak rule in §3.3 no longer references them.
+
+### 3.9 confidence: defined and calibrated (new in v2.3)
+
+the game abstains based on confidence. low-confidence frames aren't scored, and a run with >20% of them isn't graded (game doc §1.2). v2 published `F0Confidence` and `VoicingConfidence` without defining either, and a threshold on an undefined number is a guess. so:
+
+- **meaning.** published confidences are calibrated probabilities:
+  - `F0Confidence` = P(`F0Hz` is not a gross error, i.e. within 20% of reference | frame published Voiced)
+  - `VoicingConfidence` = P(the published voicing state matches the reference label)
+
+  a game floor of 0.9 then means "expect ≤ 10% gross errors among the frames that get scored."
+- **raw score.** before calibration, each confidence is a raw score built from evidence the analyzer already has. for f0: 1 − d′ at the chosen lag, candidate stability (§3.3), level above the noise floor, and whether octave correction stepped in. for voicing: distance from the nearest classification threshold, plus hysteresis state.
+- **calibration.** fit a monotone map from raw score to probability on the **dev split** (isotonic regression or binned), then check it on held-out (§6). the calibration table is part of `AnalysisConfig`, so the config hash covers it. recalibrating bumps `AnalyzerVersion`, so the game's PB provenance rule (game doc appendix A) archives old PBs instead of comparing across calibrations.
+- **before step 5** there's no corpus to calibrate against. the raw score is published, and the config records `ConfidenceCalibration = none` so nothing downstream mistakes it for a probability.
+
+`FormantConfidence` follows the same pattern once formant references exist (step 7).
 
 ---
 
@@ -304,14 +385,14 @@ public readonly record struct AnalysisFrame
 
     // voicing
     public VoicingState Voicing        { get; init; }
-    public float  VoicingConfidence    { get; init; }  // 0..1
+    public float  VoicingConfidence    { get; init; }  // calibrated probability, §3.9
 
     // pitch
     public float  F0RawHz              { get; init; }  // internal candidate, always logged
     public float  F0Hz                 { get; init; }  // published; NaN unless Voiced
     public float  F0DisplayHz          { get; init; }  // causal median + slew; NaN unless Voiced
     public float  F0Cents              { get; init; }  // re 55 Hz, from F0Hz
-    public float  F0Confidence         { get; init; }
+    public float  F0Confidence         { get; init; }  // calibrated probability, §3.9
     public float  Aperiodicity         { get; init; }  // YIN d′ at chosen lag
 
     // level
@@ -330,7 +411,8 @@ public readonly record struct AnalysisFrame
     public float  CppDb                { get; init; }
 
     // experimental (§3.7b) — NaN unless Voiced
-    public float  BrightnessProxy      { get; init; }
+    public float  BrightnessProxy      { get; init; }  // variant set by AnalysisConfig
+    public float  SpectralTiltDbPerKhz { get; init; }
 }
 ```
 
@@ -356,6 +438,8 @@ using the §3.1 definitions. algorithmic delay (event → frame that reflects it
 | render queue + 60 fps scanout | 16–33 ms |
 | **user-to-photon, realistic** | **~70–110 ms on steps, ~50–80 ms steady-state** |
 
+capture-to-result (§3.1) is only the "analysis compute + scheduling" row. it's the part optimization can actually move, which is why it gets its own threshold at Gate B. the YIN half-width row is algorithmic delay, a constant.
+
 v1's "~43 ms" counted only the parts that are easy to count. the honest number is worse, and it still cannot be fixed by optimization — YIN needs 2–3 periods, and at 80 Hz that's 25–37 ms of audio before any answer *exists*.
 
 this is why the game is a **tracing** game, not a **hitting** game. sustained lines and glides tolerate this; tight timing windows do not. **measure user-to-photon with the camera test (§3.1) on real hardware before committing to any chart design** — the loopback test only measures the audio half, and gates in §6 are on measured numbers, not this table.
@@ -370,9 +454,12 @@ this is the part that makes the difference between "seems fine on my voice" and 
 
 ```
 corpus/
-  manifest.csv       speaker_id, file, device, os, condition, task, vowel,
-                     target_f0, os_processing_flags (AGC/NS on|off|unknown),
-                     consent_ref
+  manifest.csv       speaker_id, file, source, session_id, device, os,
+                     condition, task, vowel, target_f0,
+                     os_processing_flags (AGC/NS on|off|unknown), consent_ref
+                     (source: actor | self | volunteer | public — see
+                     "recording sources"; session_id links files captured
+                     at the same time on different devices)
   audio/*.wav        48 kHz mono (44.1 kHz accepted; resample logged)
 ```
 
@@ -387,9 +474,9 @@ Praat agreement can just mean two systems share the same assumptions, especially
 1. **synthetic signals** with mathematically known f0 (and known formants via Klatt-style synthesis when we get to formant gates) — the only true ground truth we have.
 2. **Praat via parselmouth** as a *versioned comparison baseline*: pin the Praat version and record every setting (pitch floor/ceiling, time step, max formant, LPC order) in the run summary. same 10 ms grid.
 3. **hand-labeled hard subset**: creak, soft phonation, onsets/offsets, octave-error bait. labeled per a written annotation guide; creak labels from 2 annotators with inter-rater agreement reported. disagreement frames are excluded from gates and reported separately.
-4. later, if available: EGG or acoustic pulse references.
+4. **EGG / laryngograph references: partly available now** (v2.3; v2 said "later, if available"). public corpora recorded with a laryngograph give true f0 ground truth on real speech: PTDB-TUG and the Keele pitch database. Hillenbrand et al.'s vowel set (men, women and children) gives hand-checked formant values, including high-f0 cases. these are studio-condition and not this product's population, so they supplement the corpus rather than replace it. **check each license** before using it in a commercial product's development. if a paid session can be run with an EGG (e.g. through a university voice lab), those recordings get the same ground truth.
 
-**the causal live output is the product gate.** centered-offline numbers are reported separately and never substituted.
+**real recordings are the product gate; synthetic signals are unit-test infrastructure.** synthetic signals are the only *exact* ground truth, so they own the algorithm tests (§3.4). but no threshold is accepted on synthetic data alone. **the causal live output on real recordings is the product gate.** centered-offline numbers are reported separately and never substituted.
 
 ### metrics
 
@@ -399,8 +486,11 @@ Praat agreement can just mean two systems share the same assumptions, especially
 | FPE | RMSE in cents on frames voiced in both and not GPE | |
 | VDE | % frames with mismatched voiced/unvoiced decision | plus full 4-state confusion matrix (Silence/Unvoiced/Voiced/Creak) |
 | voicing P/R | precision & recall for Voiced, and for Creak vs hand labels | |
-| formant error | mean \|F − F_ref\| per formant (F1–F4 each), voiced frames | F3/F4 gated too — resonance estimates depend on them |
-| p95 capture-to-result | measured | |
+| formant error | mean \|F − F_ref\| per formant (F1–F4 each), voiced frames | F3/F4 gated too — resonance estimates depend on them. reported per f0 band (§3.6) |
+| confidence calibration | per confidence bin: predicted vs observed non-GPE rate; expected calibration error | v2.3, §3.9. scored on held-out |
+| coverage at floor | % of ref-voiced frames published Voiced with F0Confidence ≥ floor, at floors 0.5 / 0.8 / 0.9 | v2.3. the number of frames the game will actually be allowed to score. an analyzer can post a good GPE by marking hard frames low-confidence; this metric catches it |
+| resonance specificity | proxy/formant change for a posture contrast ÷ change for pitch, loudness, and weight contrasts (each separately) | v2.3, §3.7b. cross-talk tasks |
+| p95 capture-to-result | measured (§3.1 definition) | |
 | user-to-photon | measured, camera test | reported, not gated in phase 0 |
 
 **aspirational targets** (clean-slice): GPE < 2%, FPE < 15 cents, VDE < 5%, F1/F2 error < 60 Hz. but:
@@ -409,14 +499,30 @@ Praat agreement can just mean two systems share the same assumptions, especially
 - the corpus is split **dev / held-out** (by speaker, not by file). thresholds are tuned on dev; the held-out set is scored untouched and reported alongside.
 - until slices reach minimum size, CI gates are **regression gates**: no metric may worsen by more than its CI vs the last accepted run.
 
-**compute everything per corpus slice, not just in aggregate.** a global pass rate hides failing entirely on gaming headsets. once slices are big enough, gate CI on the worst qualifying slice.
+**compute everything per corpus slice, not just in aggregate.** a global pass rate hides failing entirely on gaming headsets. once slices are big enough, gate CI on the worst qualifying slice. slices cut by device/condition, by task, and (v2.3) by **f0 band**: < 150 Hz, 150–250 Hz, > 250 Hz. the octave-down bias (§3.4) and the LPC degradation (§3.6) both depend on f0, and an aggregate would average them away.
 
 ### corpus contents
 
 - **conditions**: studio/condenser, laptop built-in, gaming headset, noisy room; with OS processing flags recorded (and disabled where possible)
-- **tasks**: sustained /a/ /i/ /u/ at 5 pitch targets; ascending and descending glides; **soft/breathy sustained phonation** (near-floor level — this tests the §3.3 level gate); **resonance manipulation** (same speaker, same vowel, same pitch target, contrasted tract postures — e.g. instructed "bright/forward" vs neutral — repeated across devices and across sessions; this task feeds the game's resonance-signal gate, game doc §1.5); read passage (Rainbow Passage, public domain); spontaneous speech
-- **adversarial**: deliberate creak, deliberate falsetto, breathy onset, whisper, cough, laugh, background music
-- **speakers**: as wide an f0 range as recruitable — coverage across 80–350 Hz, multiple voice types, not just your own voice
+- **tasks**:
+  - sustained /a/ /i/ /u/ at 5 pitch targets
+  - ascending and descending glides, including **sirens that go above 600 Hz** (§3.4)
+  - **soft/breathy sustained phonation** at near-floor level. this tests the §3.3 level gate and breathy path.
+  - **resonance manipulation**: same speaker, same vowel, same pitch target, contrasted tract postures (e.g. instructed "bright/forward" vs neutral), repeated across devices and across sessions. this task feeds the game's resonance-signal gate (game doc §1.5).
+  - **resonance cross-talk** (v2.3): tract posture held fixed while one other thing changes. (a) a slow pitch glide, (b) soft / normal / loud at one pitch, (c) light vs heavy vocal weight at one pitch. these score specificity (§3.7b).
+  - read passage (Rainbow Passage, public domain)
+  - spontaneous speech
+- **adversarial**: deliberate creak, deliberate falsetto, breathy onset, whisper, cough, laugh, background music. if the game plays reference tones (game doc part 4), add the target tone playing through laptop speakers, with and without the speaker voicing.
+- **speakers**: as wide an f0 range as recruitable, with coverage across 80–350 Hz in speech and higher in sirens, multiple voice types, and not just your own voice. include trans speakers, including voices mid-transition. they're the product's actual population, and neither public corpora nor synthetic signals cover them.
+
+**recording sources (new in v2.3)**, in order of how much each is worth per hour:
+
+- **paid voice actors / voice coaches.** they're best at the *controlled* tasks: resonance manipulation, cross-talk, deliberate creak/breathy/falsetto, and sirens. they can produce a contrast on cue and repeat it across sessions. run each paid session with **several devices recording at once** (condenser, laptop mic, gaming headset, Steam Deck side by side). one performance then yields several device slices with identical content, which isolates the device effect cleanly. but one actor is one vocal tract: **they count as one speaker for slice minimums** no matter how many voices they perform. reaching ≥ 3 speakers means ≥ 3 people.
+- **the developer's own practice sessions**, recorded through the probe. this is free, has high volume, and is the fastest way to reach the 20-file debug corpus. it's still a single speaker.
+- **volunteers** from the community, later. same consent requirements, and the widest range of voices.
+- **public reference corpora** (reference layer 4 above), for f0/formant ground truth and speaker breadth from day one.
+
+every human recording, paid or not, needs the §0 consent terms in writing: commercial development use, derived measurements, retention period, and the right to be removed. for paid work, put them in the recording release/contract before the session, not after. store the reference as `consent_ref` in the manifest.
 
 start with 20 files — that's a *debug* corpus and it will find bugs immediately. it is not enough to freeze acceptance thresholds; grow toward the slice minimums above before gates go hard.
 
@@ -434,7 +540,7 @@ noiseFloorDbfs        (measured, §3.2)
 voicedLevelMarginDb   (8, §3.3)
 latencyOffsetMs       (measured via loopback; user-to-photon measured separately)
 f0SearchMinHz         (60)
-f0SearchMaxHz         (600)
+f0SearchMaxHz         (1000; 600 fallback per §3.4)
 maxFormantHz          (5500 default; drives fs_a, LPC order, root range — §3.6)
 ```
 
@@ -444,20 +550,22 @@ maxFormantHz          (5500 default; drives fs_a, LPC order, root range — §3.
 
 do not reorder these. each one de-risks the next. (v1's order had YIN before the streaming skeleton and synthetic harness; that's backwards — the contract and the tests are what make every later stage cheap to validate.)
 
-1. **streaming skeleton + timing model.** `VoiceAnalyzer` shell, ring buffer, timestamps, `Reset`, diagnostics counters. chunk-boundary invariance test passes on a passthrough "analyzer."
-2. **synthetic signal generator + test harness.** sines, harmonic complexes, glides, noise mixes. this is infrastructure for every later gate.
-3. **capture → RMS meter.** confirms devices work, exercises the format policy. measure loopback latency now; run the camera test once for a baseline.
-4. **YIN (causal) + voicing state machine.** validate against the synthetic sweep suite, then Praat on a few recorded files.
-5. **batch mode + 20-file debug corpus + metrics script.** ← get here before formants and before octave-correction tuning. the metrics tell you whether anything works.
-6. **octave correction + creak, tuned against the corpus.** grow the corpus; add hand labels for the hard subset.
-7. **formants + resonance + brightness proxy (§3.7b).** re-run metrics with F1–F4 gates; score formants and proxy on the resonance-manipulation task.
+1. **streaming skeleton + timing model.** `VoiceAnalyzer` shell, ring buffer, frame queue, timestamps, `Reset`, diagnostics counters. chunk-boundary invariance test passes on a passthrough "analyzer."
+2. **synthetic signal generator + test harness.** sines, harmonic complexes, glides, noise mixes, breathy signals (§3.4). this is infrastructure for every later gate.
+3. **capture → RMS meter** in the Godot probe. confirms devices work and exercises the format policy. measure loopback latency now, and run the camera test once for a baseline. start the native-vs-`AudioEffectCapture` comparison here, since the probe can host both.
+4. **YIN (causal) + voicing state machine**, with the naive-sum oracle test. validate against the synthetic sweep and breathy suites, then against Praat on a few recorded files. **then add a live scrolling log-frequency pitch trace to the probe** (v2.3). it's the first thing in the build a person would use, it makes every later bug visible by eye, and your own practice through it seeds the debug corpus. this is not step 8 early. step 8 tests *two* dimensions together, which needs step 7.
+5. **batch mode + 20-file debug corpus + metrics script.** ← get here before formants and before octave-correction tuning. the metrics tell you whether anything works. the debug corpus can be your own sessions plus public references (§6). fit the first confidence calibration here (§3.9).
+6. **octave correction + creak, tuned against the corpus.** grow the corpus (first paid session fits here, see §6 recording sources); add hand labels for the hard subset; design and validate the subharmonic rule (§3.3).
+7. **formants + resonance + brightness proxy (§3.7b).** re-run metrics with F1–F4 gates; score formants and both proxy variants on the resonance-manipulation and cross-talk tasks.
 8. **live visualization.** log-frequency pitch line plus a second resonance indicator — find out now whether two simultaneous tracked dimensions are legible or overwhelming.
 
-**Gate A (analyzer viability) after step 6:** if GPE and VDE won't come down on the noisy, soft, and creaky slices, change approach while it's cheap. **Gate B (product readiness) after step 8** is owned by the game design doc: resonance-signal decision (formants vs §3.7b proxy on the resonance-manipulation task), two-dimension legibility, and the product latency thresholds — this spec measures p95 capture-to-result and user-to-photon and reports them; the thresholds on those numbers are product requirements and live in the game doc. deferred to phase 1: pulse-synchronous analysis (real jitter/shimmer, better creak), H1–H2 with formant correction, any user-facing VTL.
+**Gate A (analyzer viability) after step 6:** if GPE and VDE won't come down on the noisy, soft, and creaky slices, change approach while it's cheap. v2.3 adds **coverage on the soft/breathy slice** at the game's default confidence floor. if too few breathy frames clear the floor, typical breathy runs trip the game's 20% unreliable-run rule and come back ungraded, which fails a core practice mode even when GPE looks fine. **Gate B (product readiness) after step 8** is owned by the game design doc: resonance-signal decision (formants vs §3.7b proxy on the resonance-manipulation task), two-dimension legibility, and the product latency thresholds — this spec measures p95 capture-to-result and user-to-photon and reports them; the thresholds on those numbers are product requirements and live in the game doc. deferred to phase 1: pulse-synchronous analysis (real jitter/shimmer, better creak), H1–H2 with formant correction, any user-facing VTL.
 
 ---
 
-## 12. change log vs v1
+## 9. change log vs v1
+
+(v2.3: renumbered from §12, since §9–11 never existed.)
 
 accepted from the Sol review: streaming stateful API with chunk invariance (§1.1); voicing/creak contradiction fixed via explicit decision order and multi-frame creak (§3.3); jitter/shimmer removed as invalidly defined (§3.8); frame struct compile fix + timestamps + per-feature confidence (§4); latency semantics split into algorithmic/capture-to-result/user-to-photon (§3.1, §5); Praat demoted to versioned baseline within a layered reference stack (§6); exact YIN difference formula + tolerance-based sweep tests (§3.4); ring overflow policy (§2); `maxFormantHz` made to actually drive the pipeline (§3.6); formant track birth/death rules (§3.6); VTL rescoped to experimental batch aggregate (§3.7); dev/holdout split, slice minimums, confusion matrix (§6); device format + OS-processing policy (§3, §6); analysis/interpretation boundary and privacy requirements promoted to §0.
 
@@ -466,3 +574,13 @@ departures from the Sol review: **CPP stays in phase 0** — unlike jitter/shimm
 v2.2 (2026-08-19, from the second Sol review of the game design doc): resonance-manipulation corpus task added to §6; experimental brightness proxy specified (§3.7b) with a `BrightnessProxy` frame field; build-order gate renamed Gate A, with Gate B (product readiness, after step 8) defined in the game design doc — latency thresholds clarified as product requirements measured here but gated there.
 
 new in v2 beyond both: level gate lowered to +8 dB with soft-phonation corpus coverage (v1's +12 dB would classify quiet breathy practice — a core use case — as silence); left-channel downmix rationale; causal-median settling counted honestly as perceived lag; creak detection decoupled from a valid f0 so sub-60 Hz creak still classifies.
+
+v2.3 (2026-09-28, fresh-eyes review before any code):
+
+- **voicing**: breathy path (stable f0 candidate + elevated aperiodicity → Voiced, reduced confidence), because v2 would have filed breathy phonation as Creak or Unvoiced. v2's subharmonic test was non-discriminating and is now logged-only until step 6. ZCR defined. what gets published during a hysteresis hold is defined (§3.3).
+- **YIN**: fixed-integration-window difference function per the YIN paper, because v2's shrinking sum biased toward octave-down errors on higher voices. search ceiling 1000 Hz for sirens, with a fallback to 600 Hz per exercise. naive-sum test oracle. breathy and octave-up test suites (§3.4). the octave-correction lag range is bounded (§3.5).
+- **confidence**: defined as calibrated probabilities, fit on dev and checked on held-out, versioned with the config. the metrics add calibration and coverage-at-floor (§3.9, §6). Gate A adds breathy-slice coverage (§8).
+- **plumbing**: frame queue alongside the triple buffer, so traces and scoring see every frame (§2). capture-to-result measured from the frame's last sample (§3.1, §5). `MaxFramesFor` output-capacity contract (§1.1).
+- **resonance**: the brightness proxy's confound with spectral tilt/effort is spelled out as a strain incentive. specificity is a gate criterion with cross-talk corpus tasks. a tilt-normalized variant is added. `SpectralTiltDbPerKhz` is published (§3.7b). LPC degradation at high f0 is noted, and metrics are sliced by f0 band (§3.6, §6).
+- **corpus**: real recordings are the product gate. a recording-sources section covers paid voice actors (one actor = one speaker; record multiple devices at once), own sessions, volunteers, and public laryngograph-referenced corpora with license checks. trans and mid-transition voices are named as coverage (§6).
+- **project**: the probe moves from Avalonia to Godot. MathNet is replaced by a preallocated root finder (it allocated per call, breaking §1.1). the TFM note covers .NET 8 end of support (§1, §1.2). build order: live pitch trace at step 4, capture-path comparison at step 3 (§8).
