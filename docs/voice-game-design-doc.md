@@ -1,8 +1,16 @@
-# voice training game — design doc & roadmap v2
+# voice training game — design doc & roadmap v2.3
 
-companion to `voice-analysis-spec-v2.md`, which covers phase 0. this doc picks up after the analysis prototype clears its decision gate.
+companion to `voice-analysis-spec.md`, which covers phase 0. this doc picks up after the analysis prototype clears its decision gate.
 
-v2 incorporates a design review plus four direction decisions (hybrid chart targets, friends-only social, rating exchange cut to research note, resonance proxy fallback). v2.2 applies the second Sol review: phase 0 gate split, a normative scoring appendix, curriculum matched to shipped mechanics, goal ownership fixed, replay privacy mechanics specified, and the perception model rescoped. changes are summarized in part 5.
+v2 incorporates a design review plus four direction decisions (hybrid chart targets, friends-only social, rating exchange cut to research note, resonance proxy fallback). v2.2 applies the second Sol review: phase 0 gate split, a normative scoring appendix, curriculum matched to shipped mechanics, goal ownership fixed, replay privacy mechanics specified, and the perception model rescoped. v2.3 (paired with analyzer spec v2.3) adds:
+
+- a resonance specificity gate
+- confidence floors with a defined meaning
+- a precise capture-to-result threshold
+- reference tones as an open decision
+- cross-reference fixes
+
+changes are summarized in part 5.
 
 ---
 
@@ -47,7 +55,7 @@ v1 claimed collection score was fair because "everyone plays the same charts," w
 
 - **scored library (collection charts): absolute targets**, deliberately authored inside a band nearly every post-warmup voice can reach safely. these are identical for everyone — that's what makes grades and collection score comparable, and it keeps the promise that someone with the hardest starting voice can still 100% the game.
 - **campaign and free practice: personalized targets**, placed relative to your assessed range and goals. always safe, always relevant, graded for feedback but not counted in collection score.
-- the safe-range gate (§1.8) applies to both. a scored chart that a user's current safe range can't reach yet shows as "not yet in range" with the assessment path to unlock it — never as a failure.
+- the safe-range gate (§1.9) applies to both. a scored chart that a user's current safe range can't reach yet shows as "not yet in range" with the assessment path to unlock it — never as a failure.
 - **the universal band is a hypothesis, not a fact** (v2.2). it gets tested against the phase 0 corpus's range data plus SLP input, and it may fail — there may be no pitch+resonance band that is simultaneously safe, reachable, and worth practicing for the whole audience. defined fallback if so: collection score switches to an **eligible-chart denominator** — mastery % computed over the charts within each player's assessed range, denominator always visible ("S-ranked 34 of your 52 eligible") — and friends comparison additionally surfaces the identical-chart subset both players can access. that degrades comparability honestly instead of quietly breaking the 100%-for-everyone promise.
 
 ### chart grade — the engagement loop
@@ -72,14 +80,29 @@ frame policy (new in v2 — this is what makes grading feel fair):
   - creak while voice is expected: scores as miss frames, but the UI shows
     a creak indicator, not a generic miss — the user should learn what
     happened, not just that it "missed."
-  - low-confidence frames (per VoiceCore confidence fields) are excluded
-    from scoring entirely. if >20% of a run's frames are low-confidence,
-    the run is flagged "tracking unreliable" and not graded. never grade
-    a run the tracker couldn't actually see — a wrong grade costs trust
-    that honest abstention doesn't.
+  - unreliable frames are excluded from scoring, per dimension. if a
+    run has too many of them, it isn't graded on that dimension. never
+    grade what the tracker couldn't actually see — a wrong grade costs
+    trust that honest abstention doesn't.
+    "unreliable" (v2.3) depends on which confidence answers the question
+    being scored (analyzer spec §3.9). each is a calibrated probability
+    checked against a per-chart floor, default 0.9:
+      - voicing state (is there voice, creak, or nothing?):
+        VoicingConfidence. a confidently detected Creak or Unvoiced frame
+        is a Miss, not an abstention.
+      - pitch on a Voiced frame: F0Confidence. 0.9 means "≤ 10% chance
+        this frame's pitch is a gross error." F0Confidence doesn't exist
+        for non-Voiced frames and is never consulted for them.
+      - resonance on a Voiced frame: its own validity and confidence
+        rules. high pitch confidence says nothing about F2.
+    the full per-dimension table is in appendix A. the floors trade
+    wrong grades (too low) against ungraded runs (too high). the
+    analyzer's coverage-at-floor metric measures the second, and the
+    defaults get tuned at Gate A, especially on breathy phonation.
 
 chart score = weighted mean of frame accuracy × completion, scaled to 1,000,000
-  (completion = fraction of scoreable chart time with a scoreable attempt)
+  (per dimension: completion = fraction of scoreable chart time with a
+  judged frame on that dimension; see appendix A)
 
 letter thresholds:  D 50%  |  C 65%  |  B 78%  |  A 88%  |  S 95%
 Full Combo = zero Miss segments
@@ -139,7 +162,7 @@ so the game's stance, stated plainly in the UI where the question naturally aris
 - the replay loop gives them their own ears, which adapt slower than their self-perception distorts
 - if they want human perceptual feedback, the game points outward — coaches, communities they already trust — rather than simulating it
 
-**the blind community rating exchange from v1 is cut from the roadmap** (decision, 2026-08). it was the most legally and moderation-expensive feature in the doc, everything else works without it, and shipping it half-resourced is worse than not shipping it. it survives as a research note in part 4 in case it's ever revisited with real funding for moderation, abuse design, and counsel. the perception model (§1.10) no longer assumes its data exists.
+**the blind community rating exchange from v1 is cut from the roadmap** (decision, 2026-08). it was the most legally and moderation-expensive feature in the doc, everything else works without it, and shipping it half-resourced is worse than not shipping it. it survives as a research note in part 4 in case it's ever revisited with real funding for moderation, abuse design, and counsel. the perception model (§1.11) no longer assumes its data exists.
 
 ## 1.4 what gets measured
 
@@ -151,7 +174,7 @@ so the game's stance, stated plainly in the UI where the question naturally aris
 
 **resonance is not optional in the MVP.** it's roughly co-equal with pitch in the literature on perceived gender, and shipping a "voice training game" that only tracks pitch would be a legitimate criticism.
 
-**weight has an analyzer dependency** (new in v2): jitter/shimmer and H1–H2 were cut from analyzer phase 0 as invalidly defined without pulse-synchronous analysis; CPP survived as a diagnostic. the phase 2 weight dimension therefore depends on analyzer phase 1 work (pulse extraction, corrected H1–H2) clearing its own validation before weight becomes a *scored* dimension. spectral tilt + CPP may carry an unscored "weight meter" earlier.
+**weight has an analyzer dependency** (new in v2): jitter/shimmer and H1–H2 were cut from analyzer phase 0 as invalidly defined without pulse-synchronous analysis; CPP survived as a diagnostic. the phase 2 weight dimension therefore depends on analyzer phase 1 work (pulse extraction, corrected H1–H2) clearing its own validation before weight becomes a *scored* dimension. spectral tilt + CPP may carry an unscored "weight meter" earlier. (v2.3: the analyzer now publishes `SpectralTiltDbPerKhz` as an experimental field, analyzer spec §3.7b.)
 
 **breathiness stays out of scored mechanics.** it's widely taught as a feminization lever but the evidence that it moves gender perception is genuinely mixed. teach it if the SLP says to; don't build a rank around it.
 
@@ -161,11 +184,12 @@ so the game's stance, stated plainly in the UI where the question naturally aris
 
 live per-frame LPC formant tracking is the least proven part of the analysis chain, and analyzer v2 already rescoped VTL to a batch-only experimental aggregate. the game must not bet its co-equal-with-pitch dimension on the shakiest tracker output. so, two layers:
 
-- **measured truth**: formants (F1–F4) from the analyzer, used for the voice profile, progress trends, and batch analysis. computed on fixed-vowel exercises where they're actually comparable.
+- **measured truth**: formants (F1–F4) from the analyzer, used for the voice profile, progress trends, and batch analysis. computed on fixed-vowel exercises where they're actually comparable. caveat (v2.3): LPC formants get less reliable as f0 rises (analyzer spec §3.6), and that's the direction many users are heading. trend and profile displays must carry the formant confidence, so an apparent resonance change isn't really a pitch change showing through a degrading measurement.
 - **gameplay signal**: the resonance lane is driven by whichever signal *passes validation on the phase 0 corpus*:
   - primary candidate: tracked F2 (or formant dispersion) on fixed-vowel charts, smoothed for display
   - fallback: a simpler spectral-brightness proxy (e.g., energy balance between low and mid bands, or spectral centroid over 0–4 kHz) computed on the same fixed vowel, validated *against* formant measurements offline so it demonstrably moves when resonance moves
-  - validation gate (tightened in v2.2 — this is real work, not a freebie): the phase 0 corpus gains a dedicated **resonance-manipulation task** (same speaker, same vowel, same pitch target, contrasted tract postures, repeated across devices and sessions — now specified in analyzer spec v2 §6), and both candidate signals are scored on it for **direction accuracy** (does the signal move the right way when the tract changes), **test–retest stability**, and **cross-device sensitivity**. the gameplay signal is whichever passes. if neither does, that's a phase 0 red flag on the resonance lane itself, surfaced at Gate B (part 2, phase 0) — not discovered in phase 1
+  - validation gate (tightened in v2.2 — this is real work, not a freebie): the phase 0 corpus gains a dedicated **resonance-manipulation task** (same speaker, same vowel, same pitch target, contrasted tract postures, repeated across devices and sessions — now specified in analyzer spec §6), and both candidate signals are scored on it for **direction accuracy** (does the signal move the right way when the tract changes), **test–retest stability**, **cross-device sensitivity**, and (v2.3) **specificity**. the gameplay signal is whichever passes. if neither does, that's a phase 0 red flag on the resonance lane itself, surfaced at Gate B (part 2, phase 0) — not discovered in phase 1
+  - why specificity is a safety criterion (v2.3): brightness measures rise when spectral tilt flattens, and tilt flattens when you push harder or phonate heavier. an unchecked proxy would score a user *better* for pressing, which is a strain incentive that §1.9 forbids. it would also score lighter phonation, a common goal, as *darker*. so the signal must move more for a posture contrast than for pitch, loudness, or weight changes at a fixed posture. the analyzer spec's cross-talk corpus tasks measure this (§3.7b, §6), and a tilt-normalized proxy variant is scored alongside the raw one
 
 the MVP ships either way. the UI never claims more precision than the signal carries; if the proxy ships, the profile still reports real formants from batch analysis.
 
@@ -177,7 +201,7 @@ tag every logged frame with the expected vowel so batch analysis can group corre
 
 ## 1.7 tracing, not hitting
 
-the analysis chain has a hard latency floor — YIN needs 2–3 periods of audio before any answer exists, and the honest end-to-end number (analyzer spec v2 §5) is **~50–80 ms steady-state and ~70–110 ms on transitions**, user-to-photon, not v1's optimistic ~40 ms. it cannot be engineered away.
+the analysis chain has a hard latency floor — YIN needs 2–3 periods of audio before any answer exists, and the honest end-to-end number (analyzer spec §5) is **~50–80 ms steady-state and ~70–110 ms on transitions**, user-to-photon, not v1's optimistic ~40 ms. it cannot be engineered away.
 
 so: **sustained lines, glides, and contours.** no tight timing windows, no discrete note-hits with millisecond judgment. the highway is something you trace, not something you strike. scoring compensates for the measured latency offset (calibration parameter) so the trace is *judged* against where the voice actually was, even though it *renders* late.
 
@@ -203,7 +227,7 @@ vocal strain is a real injury risk and this is the part that must not be an afte
 ## 1.10 privacy
 
 - **all analysis is local.** no audio leaves the machine by default. run recordings (§ replay loop) are local, session-ephemeral unless pinned, and bulk-deletable.
-- no audio, frames, or derived voice measurements in telemetry or crash reports (inherited from analyzer spec v2 §0 — same rule, same wording).
+- no audio, frames, or derived voice measurements in telemetry or crash reports (inherited from analyzer spec §0 — same rule, same wording).
 - say all of this plainly on the store page — for this audience it's a purchase decision, not fine print.
 - voice is treated as biometric data under Illinois BIPA, Texas CUBI, and Washington state law. get counsel before any feature that transmits or stores audio server-side. (with the rating exchange cut, *no current roadmap feature transmits audio.* keep it that way unless something earns the legal spend.)
 
@@ -237,13 +261,16 @@ a trans-focused title on Steam will attract exactly what you'd expect. decide be
 
 phase 0 exits through **two gates** (v2.2 — the two docs previously disagreed on where the gate sat and what it contained):
 
-**Gate A — analyzer viability**, after analyzer build step 6, exactly as `voice-analysis-spec-v2.md` §8 defines it: GPE < 2%, VDE < 5%, FPE < 15 cents aspirational — gating per slice only where slices meet minimum size (≥3 speakers, ≥10 files), regression gates elsewhere, scored on the **causal live output**. if the noisy, soft, and creaky slices won't come down, change approach here. it's cheap now and expensive everywhere after.
+**Gate A — analyzer viability**, after analyzer build step 6, exactly as `voice-analysis-spec.md` §8 defines it: GPE < 2%, VDE < 5%, FPE < 15 cents aspirational — gating per slice only where slices meet minimum size (≥3 speakers, ≥10 files), regression gates elsewhere, scored on the **causal live output**. v2.3 adds coverage on the soft/breathy slice at the §1.2 confidence floor: an analyzer that leaves typical breathy runs "tracking unreliable" fails here even if GPE looks fine. if the noisy, soft, and creaky slices won't come down, change approach here. it's cheap now and expensive everywhere after.
 
 **Gate B — product readiness**, after analyzer build step 8 and before any phase 1 work:
 
-- the resonance-signal decision (§1.5): formants or the brightness proxy must pass direction accuracy, test–retest, and cross-device criteria on the resonance-manipulation corpus task
+- the resonance-signal decision (§1.5): formants or the brightness proxy must pass direction accuracy, test–retest, cross-device, and specificity criteria on the resonance-manipulation and cross-talk corpus tasks
 - the two-dimension legibility verdict from the live visualization
-- p95 capture-to-result < 25 ms, and camera-test user-to-photon inside the §1.7 envelope, on target hardware including a Steam Deck. these thresholds are **product requirements and live in this document** — the analyzer spec measures and reports the numbers but does not gate on them.
+- p95 capture-to-result < 10 ms, measured per analyzer spec §3.1 from the arrival of the last sample a frame depends on. that's compute plus scheduling only; the fixed ~21 ms algorithmic delay is reported separately and belongs to the user-to-photon envelope. (v2.3: v2.2 said < 25 ms against an ambiguous definition. measured from the window center, the same frame reads ~21 ms slower, so 25 ms was either trivially met or barely failed depending on the reading.)
+- camera-test user-to-photon inside the §1.7 envelope, on target hardware including a Steam Deck.
+
+these thresholds are **product requirements and live in this document**. the analyzer spec measures and reports the numbers but does not gate on them.
 
 ## phase 1 — MVP
 
@@ -253,7 +280,7 @@ phase 0 exits through **two gates** (v2.2 — the two docs previously disagreed 
 
 ### 1a — integration and calibration
 
-- **capture path decision** (new in v2): evaluate native in-process capture (PortAudioSharp, as in VoiceProbe) against Godot's `AudioEffectCapture` before committing. `AudioEffectCapture` routes through Godot's audio server (extra buffering, less control over device format, possible OS-processed stream); VoiceCore doesn't care where buffers come from, so use whichever path measures better on latency and rawness. the probe already proved the native path works.
+- **capture path decision** (new in v2): evaluate native in-process capture (PortAudioSharp, as in VoiceProbe) against Godot's `AudioEffectCapture` before committing. `AudioEffectCapture` routes through Godot's audio server (extra buffering, less control over device format, possible OS-processed stream); VoiceCore doesn't care where buffers come from, so use whichever path measures better on latency and rawness. (v2.3: VoiceProbe is now a Godot project, so this comparison starts in phase 0 at analyzer build step 3. 1a confirms the choice rather than starting it.)
 - **onboarding flow**: device selection, input gain, noise floor measurement, latency offset (loopback or manual tap-to-sync)
 - **baseline voice assessment**: comfortable speaking f0, range floor and ceiling, resonance baseline, one read passage
 - assessment output writes **observed range and the safe-range gate only** (v2.2 — measurement, not goals). goal bands are *chosen by the user* in a separate onboarding step: the UI may offer starting suggestions relative to the observed range, but the user places and confirms them, may skip entirely, and **goal-band editing ships in the MVP**. this keeps the analyzer-spec rule intact: goals are user-chosen, editable, and default to nothing.
@@ -263,7 +290,7 @@ phase 0 exits through **two gates** (v2.2 — the two docs previously disagreed 
 - log-frequency pitch line with HDR neon glow
 - resonance as a second visual dimension, redundantly encoded (§1.8)
 - one background theme
-- chart format defined and serialized. a chart is: target contour per scored dimension, vowel, duration, per-dimension judgment windows (defaulting from §1.2), breath/grace marks, dimensions scored, and whether it's a scored-library (absolute) or personalized chart
+- chart format defined and serialized. a chart is: target contour per scored dimension, vowel, duration, per-dimension judgment windows (defaulting from §1.2), breath/grace marks, dimensions scored, per-confidence floors (appendix A), and whether it's a scored-library (absolute) or personalized chart. pitch targets must sit ≥ 100 cents inside the analyzer's search range for that exercise type (v2.3, appendix A)
 
 ### 1c — tutorial campaign
 
@@ -347,6 +374,8 @@ any bucketed metric introduced here needs **hysteresis** — harder to fall than
 | safe-range protocol unwritten when 1a is built | severe | SLP-authored assessment protocol is a named phase 1a dependency (§1.9) |
 | no universal scored band exists | medium | hypothesis tested against phase 0 range data; eligible-denominator fallback pre-defined (§1.2) |
 | perception-model pressure returns (users want a passing score) | medium | §1.3 stance; §1.11 reopening bar; goal-band analytics answer the diagnostic need without perceptual claims |
+| resonance signal rewards pressed/effortful phonation | severe | specificity gate at Gate B; cross-talk corpus tasks; tilt-normalized proxy variant (§1.5) |
+| reference tone through speakers gets tracked and scored as the user | high | open decision (part 4); tone-bleed corpus condition in phase 0 |
 
 ---
 
@@ -357,6 +386,12 @@ open:
 - does the campaign lead with **pitch** or **resonance**? pedagogically defensible both ways, and it changes lesson order and which charts ship first. this is an SLP question.
 - **who reviews the curriculum and writes the assessment/safety protocol, and when do you book them?** the protocol is now a phase 1a blocker (§1.9), so this has the longest lead time of anything in the doc. start now.
 - exact placement of the scored library's "reachable by nearly everyone" band — needs the phase 0 corpus's range data plus SLP input, not a guess. fallback pre-defined in §1.2 if no such band exists.
+- **does the game play reference tones?** (new in v2.3.) hearing the target pitch is standard in pitch training, and nothing in this doc says yes or no. if tones play through laptop or Deck speakers while the mic is live, the analyzer will track the speaker and score it as a perfect run. options:
+  - require headphones for charts with a tone
+  - detect bleed: the game knows exactly what it played, so a frame whose f0 and level match the reference too well can be flagged
+  - play the tone only *before* each segment (a count-in), never during
+
+  this affects chart design (§1.2 breath/grace marks), onboarding, and the phase 0 corpus (analyzer spec §6 has a conditional tone-bleed task). decide before chart format is frozen in 1b.
 
 resolved in v2 (recorded so they stay resolved): hybrid chart targets; friends-only opt-in comparison, no global leaderboards at launch; rating exchange cut from roadmap; resonance proxy fallback accepted; non-binary/androgynous goals handled natively by user-set goal bands with no two-pole visuals (§ voice profile).
 
@@ -372,10 +407,29 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 
 - **frame values**: Perfect = 1.0, Great = 0.6, Good = 0.3, Miss = 0.0.
 - **miss segments vs miss frames**: miss-quality frames become a *Miss segment* only as part of a ≥5-consecutive-frame run. shorter excursions still score 0.0 per frame, but they do not break Full Combo and are not displayed as Misses — **display and FC track segments; score tracks frames.** no frame is ever double-counted or retroactively rescored.
-- **exclusions**: low-confidence frames and grace-window frames are removed from the accuracy numerator *and* denominator. low-confidence exclusions still count against completion; grace windows don't (they were never scoreable time).
-- **completion** = attempted-and-scoreable frames / (chart frames − grace frames). runs with completion < 60% are shown as "incomplete," ungraded, and cannot set PBs.
-- **unreliable runs**: >20% low-confidence frames → no grade, no PB (§1.2). exclusion is analyzer-driven and cannot be triggered per-frame by the user; paired with the completion rule, going quiet to protect a score just produces an incomplete run.
-- **multi-dimension**: score = Σ wᵢ·scoreᵢ, default weights pitch 0.6 / resonance 0.4, then the floor rule: `final = min(weighted mean, weakest dimension + 0.15)` on the 0–1 accuracy scale. you cannot S-rank with any dimension below ~0.80.
+- **per-frame outcome, per dimension** (v2.3, Astra review). every non-grace frame gets exactly one outcome on each scored dimension. rows are checked top to bottom, and the first match wins. `floor` = the chart's floor for that confidence, default 0.9. all charts so far expect voice for their whole scoreable time.
+
+  | frame (analyzer spec §3.9) | pitch | resonance |
+  |---|---|---|
+  | `VoicingConfidence` < floor | unreliable | unreliable |
+  | Silence | unattempted | unattempted |
+  | Unvoiced or Creak | Miss (creak indicator for Creak, §1.2) | Miss |
+  | Voiced, `F0Range` = Above | Miss | per resonance rows below |
+  | Voiced, `F0Range` = Below, or `F0Confidence` < floor | unreliable | per resonance rows below |
+  | Voiced, `F0Confidence` ≥ floor | judged on cents error | per resonance rows below |
+  | ↳ resonance signal fails validity or its confidence < floor | — | unreliable |
+  | ↳ resonance signal valid and confident | — | judged on its per-dimension error |
+
+  the voicing-state rows mean a *confidently* detected Creak or Unvoiced frame is a Miss, as §1.2 requires. only an uncertain state abstains. pitch and resonance abstain independently: a frame can be pitch-judged and resonance-unreliable. a Voiced frame above the analyzer's ceiling is a Miss. the analyzer detects that case directly (analyzer spec §3.4), and charts must be authored ≥ 100 cents inside the search range, so the pitch is always a full Miss window off target. `Below` comes from a weaker fallback signal, so it abstains. resonance validity and confidence are whatever the Gate B signal ships with (analyzer spec §3.9, §1.5 here).
+- **exclusions**: unreliable frames and grace-window frames are removed from that dimension's accuracy numerator *and* denominator. unreliable frames still count against completion. grace windows don't, since they were never scoreable time.
+- **completion**, per dimension = judged frames (Misses included) / (chart frames − grace frames). unattempted and unreliable frames both lower it. a run where any graded dimension has completion < 60% is shown as "incomplete," ungraded, and cannot set PBs.
+- **unreliable runs**, per dimension: >20% unreliable frames (of chart frames − grace frames) on a dimension means that dimension is "tracking unreliable."
+  - pitch unreliable → no grade, no PB (§1.2), whatever resonance did.
+  - resonance unreliable, pitch fine → graded on pitch only. it's labeled "pitch-only run — resonance tracking unreliable" and cannot set PBs on multi-dimension charts. this is the same treatment as vowel mismatch.
+
+  exclusion is analyzer-driven and cannot be triggered per-frame by the user. paired with the completion rule, going quiet to protect a score just produces an incomplete run.
+- **per-dimension score** = accuracy (mean frame value over judged frames) × completion, on a 0–1 scale.
+- **multi-dimension**: score = Σ wᵢ·scoreᵢ, default weights pitch 0.6 / resonance 0.4, then the floor rule: `final = min(weighted mean, weakest dimension + 0.15)` on the 0–1 scale. you cannot S-rank with any dimension below ~0.80.
 - **vowel mismatch** (§1.6): the resonance dimension is dropped, the run is graded on pitch only, labeled "pitch-only run," and cannot set PBs on multi-dimension charts.
 - **PB provenance**: every PB stores `(chartVersion, scoringVersion, analyzerVersion)`. a change to any of the three archives existing PBs (still visible, labeled with their version) and starts fresh — rule changes never silently compare against old numbers, in either direction.
 
@@ -390,3 +444,12 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 **v2.2 (2026-08-19, second Sol review):** phase 0 exit split into Gate A (analyzer viability, after analyzer step 6, owned by the analyzer spec) and Gate B (product readiness, after step 8, owned here — resonance-signal decision, legibility, latency thresholds), resolving the cross-document gate mismatch; §1.5's "no extra work" claim replaced with a real resonance validation gate backed by a new resonance-manipulation corpus task and brightness-proxy contract in analyzer spec v2; the universal scored band explicitly labeled a hypothesis with a pre-defined eligible-denominator fallback; normative scoring appendix added (frame values, segment-vs-frame accounting, exclusion and completion math, weights and floor, vowel-mismatch policy, PB provenance); replay auto-recording reconciled with the privacy rules (in-memory/temp-encrypted ephemeral audio, crash sweep, pinning as the consent moment); lessons 6 and 8 made educational/ungraded in MVP instead of gating on phase 2 mechanics; assessment rescoped to write observed range and safety only, with goal bands user-chosen and editable from MVP; the safe-range assessment protocol made an SLP-authored phase 1a blocker; §1.11 rescoped — goal-band analytics (no perceptual claims) replace the diagnostic role, and the perception model is off the roadmap with a written reopening bar.
 
 **from review:** judgment windows widened to ≥2× tracker error (v1's Perfect window equaled the phase 0 FPE gate, so tracker noise would grade users); miss segments with debounce, onset/breath grace, honest creak indication, and an unreliable-run abstention rule added to grading; the replay/listen-back loop promoted to a core MVP mechanic with pinning and A/B compare (it was absent from v1 despite being half the product's premise); "three-surface architecture" corrected to four; latency claims updated to analyzer v2's measured definitions (~50–110 ms user-to-photon) with scoring compensated by the calibrated offset; phase 0 gate text aligned with analyzer v2's slice-minimum/regression-gate semantics; weight's dependency on analyzer phase 1 (pulse-synchronous analysis, corrected H1–H2) made explicit, with an unscored meter allowed earlier; `AudioEffectCapture` demoted from assumption to evaluated option against native capture; resonance encoding made redundant (colour + non-colour) as a design constraint rather than an accessibility retrofit; rest days made streak-safe with a soft daily cap on high-intensity practice; voice profile bands changed to user-set goal bands with optional off-by-default reference overlays (also resolves the v1 non-binary open question); vowel-mismatch guard added as unscored feedback; Steam Deck mic added as a phase 0 corpus condition; cloud saves explicitly exclude audio.
+
+**v2.3 (2026-09-28, paired with analyzer spec v2.3):**
+
+- **resonance**: specificity added as a §1.5 validation criterion and a Gate B requirement, because a brightness proxy confounded with spectral tilt would reward pressed phonation (a §1.9 violation) and score lighter phonation as darker. added a risk row. added a formant-confidence caveat for high f0 on the measured-truth layer.
+- **confidence and latency**: "low-confidence" defined against per-chart floors (default 0.9) on calibrated analyzer confidences (§1.2, appendix A). Gate A adds breathy-slice coverage. the Gate B capture-to-result threshold becomes < 10 ms under the analyzer's clarified definition, where the old < 25 ms sat on an ambiguity.
+- **reference tones**: added as an open decision with options, plus a risk row.
+- **capture path**: the comparison moves into phase 0 via the Godot probe (1a).
+- **per-dimension abstention** (Astra review): the single "F0Confidence below floor" rule is replaced by a per-dimension outcome table (appendix A). `VoicingConfidence` decides state judgments, so a confident Creak or Unvoiced frame is a Miss instead of an exclusion. `F0Confidence` decides voiced pitch. resonance has its own validity and confidence rules. completion and the unreliable-run rule are per dimension. an unreliable resonance lane downgrades the run to pitch-only instead of voiding it. above-ceiling f0 is a Miss, and chart pitch targets must sit ≥ 100 cents inside the search range (1b).
+- **housekeeping**: `SpectralTiltDbPerKhz` noted for the weight meter (§1.4). cross-references fixed: §1.2's safe-range gate → §1.9, §1.3's perception model → §1.11. spec references renamed to the unversioned `voice-analysis-spec.md`, since version history now lives in git.
