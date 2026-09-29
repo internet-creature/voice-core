@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace VoiceCore.Streaming;
 
 /// <summary>
@@ -21,6 +23,7 @@ public sealed class LiveAnalysisPump : IDisposable
     private readonly VoiceAnalyzer _analyzer;
     private readonly FrameQueue _frames;
     private readonly TripleBuffer<AnalysisFrame> _latest;
+    private readonly ArrivalLog? _arrivals;
     private readonly float[] _chunk = new float[MaxBacklogSamples];
     private readonly AnalysisFrame[] _frameScratch = new AnalysisFrame[VoiceAnalyzer.MaxFramesFor(MaxBacklogSamples)];
 
@@ -35,11 +38,16 @@ public sealed class LiveAnalysisPump : IDisposable
     /// Starts analysis at the ring's current write position; audio already in the
     /// ring is ignored.
     /// </summary>
+    /// <param name="arrivals">
+    /// Where the capture callback logs its writes. When given, every frame's
+    /// capture-to-result latency is recorded in <see cref="AnalyzerDiagnostics"/>.
+    /// </param>
     public LiveAnalysisPump(
         SpscOverwriteRing<float> audio,
         VoiceAnalyzer analyzer,
         FrameQueue frames,
-        TripleBuffer<AnalysisFrame> latest)
+        TripleBuffer<AnalysisFrame> latest,
+        ArrivalLog? arrivals = null)
     {
         if (audio.Capacity <= MaxBacklogSamples)
             throw new ArgumentException($"Audio ring must hold more than {MaxBacklogSamples} samples.", nameof(audio));
@@ -49,6 +57,7 @@ public sealed class LiveAnalysisPump : IDisposable
         _analyzer = analyzer;
         _frames = frames;
         _latest = latest;
+        _arrivals = arrivals;
         _position = audio.PublishedIndex;
         analyzer.Reset(_position);
     }
@@ -85,6 +94,7 @@ public sealed class LiveAnalysisPump : IDisposable
             {
                 _frames.Enqueue(_frameScratch.AsSpan(0, produced));
                 _latest.Publish(in _frameScratch[produced - 1]);
+                RecordCaptureToResult(produced);
                 total += produced;
             }
             AfterChunk?.Invoke();
@@ -123,6 +133,22 @@ public sealed class LiveAnalysisPump : IDisposable
             // wakeup latency, so it is measured at build step 3 (Gate B).
             if (_position == before)
                 Thread.Sleep(1);
+        }
+    }
+
+    /// <summary>
+    /// Frames are readable now; latency runs from the arrival of the last sample
+    /// each one depends on (spec §3.1).
+    /// </summary>
+    private void RecordCaptureToResult(int produced)
+    {
+        if (_arrivals is null)
+            return;
+        long now = Stopwatch.GetTimestamp();
+        for (int i = 0; i < produced; i++)
+        {
+            if (_arrivals.TryGetArrival(_frameScratch[i].ResultAvailableSample - 1, out long arrived))
+                _analyzer.Diagnostics.RecordCaptureToResult(now - arrived);
         }
     }
 

@@ -3,4 +3,8 @@
   <Project Path="VoiceCore.Synthetic/VoiceCore.Synthetic.csproj" />
   <Project Path="VoiceCore.Tests/VoiceCore.Tests.csproj" />
   <Project Path="VoiceCore/VoiceCore.csproj" />
+  <Project Path="VoiceProbe.Capture/VoiceProbe.Capture.csproj" />
+  <Project Path="VoiceProbe/VoiceProbe.csproj">
+    <BuildType Project="Debug" />
+  </Project>
 </Solution>

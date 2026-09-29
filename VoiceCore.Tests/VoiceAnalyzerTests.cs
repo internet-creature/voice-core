@@ -157,13 +157,7 @@ public class VoiceAnalyzerTests
         var analyzer = NewAnalyzer();
         var input = TestSignals.Busy(256);
         var output = new AnalysisFrame[VoiceAnalyzer.MaxFramesFor(input.Length)];
-        for (int i = 0; i < 100; i++)
-            analyzer.Process(input, output);  // warm up (JIT, tiering)
-
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 2000; i++)
-            analyzer.Process(input, output);
-        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        Allocation.AssertSteadyStateFree(() => analyzer.Process(input, output));
     }
 
     // --- config (§1.1) ---
