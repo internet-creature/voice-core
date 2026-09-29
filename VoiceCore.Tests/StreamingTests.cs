@@ -86,7 +86,7 @@ public class FrameQueueTests
     [Fact]
     public void DeliversEveryFrameInOrder()
     {
-        var queue = new FrameQueue();
+        var queue = new FrameQueue(new AnalyzerDiagnostics());
         for (int i = 0; i < 100; i++)
             queue.Enqueue([Frame(i)]);
 
@@ -120,7 +120,7 @@ public class FrameQueueTests
     [Fact]
     public void PartialDrainsResumeWhereTheyLeftOff()
     {
-        var queue = new FrameQueue();
+        var queue = new FrameQueue(new AnalyzerDiagnostics());
         for (int i = 0; i < 10; i++)
             queue.Enqueue([Frame(i)]);
 
@@ -248,7 +248,7 @@ public class LiveAnalysisPumpTests
         var audio = new SpscOverwriteRing<float>(1 << 17);
         audio.Write(new float[3000]);
         var analyzer = new VoiceAnalyzer(AnalysisConfig.Default);
-        var pump = new LiveAnalysisPump(audio, analyzer, new FrameQueue(), new TripleBuffer<AnalysisFrame>());
+        var pump = new LiveAnalysisPump(audio, analyzer, new FrameQueue(analyzer.Diagnostics), new TripleBuffer<AnalysisFrame>());
 
         Assert.Equal(0, pump.PumpOnce());
         audio.Write(new float[VoiceAnalyzer.WindowSamples]);
@@ -279,6 +279,79 @@ public class LiveAnalysisPumpTests
             rig.Latest.TryGetLatest(out _);
         }
         Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
+    [Fact]
+    public void RejectsQueueReportingToOtherDiagnostics()
+    {
+        var analyzer = new VoiceAnalyzer(AnalysisConfig.Default);
+        Assert.Throws<ArgumentException>(() => new LiveAnalysisPump(
+            new SpscOverwriteRing<float>(1 << 17), analyzer,
+            new FrameQueue(new AnalyzerDiagnostics()), new TripleBuffer<AnalysisFrame>()));
+    }
+
+    [Fact]
+    public void StalledConsumerOverrunsReachAnalyzerDiagnostics()
+    {
+        var rig = new Rig();
+        var chunk = TestSignals.Busy(VoiceAnalyzer.HopSamples);
+        int produced = 0;
+        while (produced < rig.Frames.Capacity + 44)
+        {
+            rig.Audio.Write(chunk);
+            produced += rig.Pump.PumpOnce();
+        }
+
+        rig.DrainAll();
+        Assert.Equal(produced - rig.Frames.Capacity, rig.Analyzer.Diagnostics.FrameQueueOverruns);
+    }
+
+    [Fact]
+    public void PumpOnceStopsAtTheAudioPresentOnEntry()
+    {
+        // regression: PumpOnce used to chase the write index, so when capture
+        // outran analysis it never returned and Stop() blocked in Join()
+        var rig = new Rig();
+        var hop = TestSignals.Busy(VoiceAnalyzer.HopSamples);
+        rig.Audio.Write(TestSignals.Busy(VoiceAnalyzer.WindowSamples));
+
+        int chunks = 0;
+        rig.Pump.AfterChunk = () =>
+        {
+            if (++chunks < 1000)
+                rig.Audio.Write(hop);  // capture keeps arriving while each chunk is analyzed
+        };
+        rig.Pump.PumpOnce();
+
+        Assert.Equal(1, chunks);
+    }
+
+    [Fact]
+    public void StopReturnsWhileCaptureContinues()
+    {
+        var rig = new Rig();
+        var chunk = TestSignals.Busy(256);
+        using var captureDone = new CancellationTokenSource();
+        var capture = new Thread(() =>
+        {
+            while (!captureDone.IsCancellationRequested)
+                rig.Audio.Write(chunk);
+        });
+
+        rig.Pump.Start();
+        capture.Start();
+        Thread.Sleep(100);
+        var stop = new Thread(rig.Pump.Stop);
+        stop.Start();
+        bool stoppedDuringCapture = stop.Join(TimeSpan.FromSeconds(2));
+        bool captureWasRunning = capture.IsAlive;
+
+        captureDone.Cancel();
+        capture.Join();
+        stop.Join();  // lets a hung Stop() finish so the thread doesn't leak
+
+        Assert.True(captureWasRunning);
+        Assert.True(stoppedDuringCapture, "Stop() hung while capture was running");
     }
 
     [Fact]

@@ -28,6 +28,9 @@ public sealed class LiveAnalysisPump : IDisposable
     private Thread? _thread;
     private volatile bool _stopRequested;
 
+    /// <summary>Test seam: runs after each analyzed chunk, e.g. to simulate capture arriving mid-pump.</summary>
+    internal Action? AfterChunk;
+
     /// <summary>
     /// Starts analysis at the ring's current write position; audio already in the
     /// ring is ignored.
@@ -40,6 +43,8 @@ public sealed class LiveAnalysisPump : IDisposable
     {
         if (audio.Capacity <= MaxBacklogSamples)
             throw new ArgumentException($"Audio ring must hold more than {MaxBacklogSamples} samples.", nameof(audio));
+        if (frames.Diagnostics != analyzer.Diagnostics)
+            throw new ArgumentException("Frame queue must report to the analyzer's diagnostics, or its overruns go uncounted.", nameof(frames));
         _audio = audio;
         _analyzer = analyzer;
         _frames = frames;
@@ -49,28 +54,28 @@ public sealed class LiveAnalysisPump : IDisposable
     }
 
     /// <summary>
-    /// Analyzes all audio available now. Returns the number of frames produced.
-    /// Call from one thread only: the analysis thread, or a test.
+    /// Analyzes the audio that had arrived when the call began, then returns, even
+    /// while capture keeps writing, so the thread loop can see a stop request.
+    /// Returns the number of frames produced. Call from one thread only: the
+    /// analysis thread, or a test.
     /// </summary>
     public int PumpOnce()
     {
         int total = 0;
-        while (true)
+        long target = _audio.PublishedIndex;
+        while (_position < target && !_stopRequested)
         {
             long published = _audio.PublishedIndex;
-            long backlog = published - _position;
-            if (backlog > MaxBacklogSamples)
+            if (published - _position > MaxBacklogSamples)
             {
-                DropBacklog(published);
+                target = DropBacklog(published);
                 continue;
             }
-            if (backlog == 0)
-                return total;
 
-            var chunk = _chunk.AsSpan(0, (int)backlog);
+            var chunk = _chunk.AsSpan(0, (int)Math.Min(target - _position, _chunk.Length));
             if (!_audio.TryCopy(_position, chunk))
             {
-                DropBacklog(_audio.PublishedIndex);
+                target = DropBacklog(_audio.PublishedIndex);
                 continue;
             }
             _position += chunk.Length;
@@ -82,7 +87,9 @@ public sealed class LiveAnalysisPump : IDisposable
                 _latest.Publish(in _frameScratch[produced - 1]);
                 total += produced;
             }
+            AfterChunk?.Invoke();
         }
+        return total;
     }
 
     /// <summary>Starts the dedicated analysis thread (not the thread pool).</summary>
@@ -119,11 +126,13 @@ public sealed class LiveAnalysisPump : IDisposable
         }
     }
 
-    private void DropBacklog(long published)
+    /// <summary>Returns the new pump target: the published index it dropped against.</summary>
+    private long DropBacklog(long published)
     {
         long resume = Math.Max(_position, published - VoiceAnalyzer.WindowSamples);
         _analyzer.Diagnostics.RecordOverrun(resume - _position);
         _position = resume;
         _analyzer.Reset(resume);
+        return published;
     }
 }

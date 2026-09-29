@@ -12,14 +12,20 @@ public sealed class FrameQueue
     public const int DefaultCapacity = 256;  // ≈ 2.5 s of frames
 
     private readonly SpscOverwriteRing<AnalysisFrame> _ring;
-    private readonly AnalyzerDiagnostics? _diagnostics;
     private long _readIndex;
 
-    public FrameQueue(AnalyzerDiagnostics? diagnostics = null, int capacity = DefaultCapacity)
+    /// <param name="diagnostics">
+    /// Where overruns are counted; pass the producing analyzer's
+    /// <see cref="VoiceAnalyzer.Diagnostics"/>.
+    /// </param>
+    public FrameQueue(AnalyzerDiagnostics diagnostics, int capacity = DefaultCapacity)
     {
+        ArgumentNullException.ThrowIfNull(diagnostics);
         _ring = new SpscOverwriteRing<AnalysisFrame>(capacity);
-        _diagnostics = diagnostics;
+        Diagnostics = diagnostics;
     }
+
+    public AnalyzerDiagnostics Diagnostics { get; }
 
     public int Capacity => _ring.Capacity;
 
@@ -50,7 +56,7 @@ public sealed class FrameQueue
             {
                 _readIndex += count;
                 if (droppedFrames > 0)
-                    _diagnostics?.RecordFrameQueueOverrun(droppedFrames);
+                    Diagnostics.RecordFrameQueueOverrun(droppedFrames);
                 return count;
             }
             // the producer lapped us mid-copy; skip past what it overwrote and retry
