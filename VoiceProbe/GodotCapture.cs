@@ -21,12 +21,17 @@ public partial class GodotCapture : Node
     private AudioEffectCapture? _effect;
     private AudioStreamPlayer? _player;
     private CaptureConverter? _converter;
+    private AnalysisPipeline? _pipeline;
+    private long _discarded;
     private float[] _left = new float[4096];
 
     public CaptureFormat? Format { get; private set; }
     public string DeviceName { get; private set; } = "";
     public long Pulls { get; private set; }
     public long LargestPullFrames { get; private set; }
+
+    /// <summary>Times Godot's capture buffer overflowed and dropped audio; each is marked as a gap.</summary>
+    public long Overflows { get; private set; }
 
     public static string[] InputDevices() => AudioServer.GetInputDeviceList();
 
@@ -47,6 +52,9 @@ public partial class GodotCapture : Node
         }
         _effect = (AudioEffectCapture)AudioServer.GetBusEffect(bus, 0);
         _effect.ClearBuffer();
+        _discarded = _effect.GetDiscardedFrames();
+        _pipeline = pipeline;
+        Overflows = 0;
 
         // Godot delivers stereo at its mix rate; the converter keeps the left channel
         Format = new CaptureFormat((int)AudioServer.GetMixRate(), 2);
@@ -63,13 +71,26 @@ public partial class GodotCapture : Node
         _player?.QueueFree();
         _player = null;
         _converter = null;
+        _pipeline = null;
         _effect = null;
     }
 
     public override void _Process(double delta)
     {
-        if (_effect is null || _converter is null)
+        if (_effect is null || _converter is null || _pipeline is null)
             return;
+
+        // Godot drops the oldest audio when its buffer fills (e.g. a long frame
+        // hitch); don't analyze across that discontinuity
+        long discarded = _effect.GetDiscardedFrames();
+        if (discarded != _discarded)
+        {
+            _discarded = discarded;
+            Overflows++;
+            _converter.Reset();
+            _pipeline.MarkGap();
+        }
+
         int available = _effect.GetFramesAvailable();
         if (available == 0)
             return;

@@ -70,6 +70,15 @@ public sealed class PolyphaseResampler
     /// <summary>Constant group delay, in output samples. Logged; it adds to input latency.</summary>
     public double DelayOutputSamples { get; }
 
+    /// <summary>Forgets all input history, as after a capture gap.</summary>
+    public void Reset()
+    {
+        Array.Clear(_history);
+        _historyPos = 0;
+        _inputCount = 0;
+        _nextOutputTime = 0;
+    }
+
     /// <summary>Upper bound on outputs one <see cref="Process"/> call can write.</summary>
     public int MaxOutputFor(int inputLength) => (int)(((long)inputLength * Up) / Down) + 1;
 

@@ -228,7 +228,8 @@ public partial class ProbeMain : Control
             $"capture-to-result      p50 {Ms(d.CaptureToResultPercentile(50))}  p95 {Ms(d.CaptureToResultPercentile(95))}  max {Ms(d.CaptureToResultMax)} ms   (Gate B: p95 < 10 ms)",
             $"algorithmic delay      {_pipeline.Analyzer.AlgorithmicDelaySamples} samples = {_pipeline.Analyzer.AlgorithmicDelaySamples / 48.0:0.0} ms (constant, reported separately)",
             $"max analysis / frame   {d.MaxAnalysisTimePerFrame.TotalMilliseconds:0.000} ms",
-            $"overruns               {d.OverrunCount} ({d.DroppedSamples} samples dropped)   frame-queue overruns {d.FrameQueueOverruns}",
+            $"overruns               {d.OverrunCount} ({d.DroppedSamples} samples dropped)   frame-queue overruns {d.FrameQueueOverruns}   capture gaps {d.CaptureGaps}",
+            $"latency not measured   {d.CaptureToResultMissed} frames (should stay 0)",
         };
         if (_native is not null)
         {
@@ -237,7 +238,7 @@ public partial class ProbeMain : Control
         }
         else
         {
-            lines.Add($"godot pulls            {_godot.Pulls}   largest pull {_godot.LargestPullFrames} frames (arrival = pull time; hides Godot's buffering)");
+            lines.Add($"godot pulls            {_godot.Pulls}   largest pull {_godot.LargestPullFrames} frames (arrival = pull time; hides Godot's buffering)   buffer overflows {_godot.Overflows}");
         }
         return string.Join('\n', lines);
     }
@@ -246,13 +247,41 @@ public partial class ProbeMain : Control
 
     private void StartLoopback()
     {
-        if (_loopbackTask is not null || _nativeInputs.Count == 0 || _nativeOutputs.Count == 0)
+        if (_loopbackTask is not null)
             return;
-        var input = _pathPicker.Selected == (int)CapturePath.Native ? _nativeInputs[_devicePicker.Selected] : _nativeInputs[0];
+        if (_nativeOutputs.Count == 0 || _outputPicker.Selected < 0)
+        {
+            _loopbackResult.Text = "Loopback needs PortAudio output devices, and none were found.";
+            return;
+        }
+        var input = LoopbackInput();
+        if (input is null)
+            return;
         var output = _nativeOutputs[_outputPicker.Selected];
         _loopbackButton.Disabled = true;
         _loopbackResult.Text = $"Running loopback {output.Label} → {input.Label} (~5 s)…";
         _loopbackTask = Task.Run(() => LoopbackTest.Run(input, output));
+    }
+
+    /// <summary>
+    /// The loopback test runs through PortAudio on either path. On the Godot path,
+    /// the selected Godot input is matched to its PortAudio device by name.
+    /// </summary>
+    private AudioDevice? LoopbackInput()
+    {
+        if (_pathPicker.Selected == (int)CapturePath.Native)
+        {
+            if (_devicePicker.Selected >= 0 && _devicePicker.Selected < _nativeInputs.Count)
+                return _nativeInputs[_devicePicker.Selected];
+            _loopbackResult.Text = "Pick an input device first.";
+            return null;
+        }
+
+        string? godotDevice = _devicePicker.Selected >= 0 ? _devicePicker.GetItemText(_devicePicker.Selected) : null;
+        var match = DeviceCatalog.MatchInput(_nativeInputs, godotDevice, DeviceCatalog.DefaultInput);
+        if (match is null)
+            _loopbackResult.Text = $"Loopback runs through PortAudio, which has no device matching '{godotDevice}'. Switch to the Native path to pick one.";
+        return match;
     }
 
     // --- self-tests (headless) ---
@@ -271,7 +300,9 @@ public partial class ProbeMain : Control
         {
             DrainFrames();
             GD.Print(DiagnosticsText());
-            bool ok = _pipeline.Diagnostics.FramesProduced > 0 && _pipeline.Diagnostics.OverrunCount == 0;
+            var d = _pipeline.Diagnostics;
+            bool ok = d.FramesProduced > 0 && d.OverrunCount == 0 && d.CaptureGaps == 0
+                      && _native.InputOverflows == 0 && d.CaptureToResultMissed == 0;
             StopCapture();
             GetTree().Quit(ok ? 0 : 1);
         };
@@ -298,18 +329,20 @@ public partial class ProbeMain : Control
     private void RefreshDevices()
     {
         _devicePicker.Clear();
+        // PortAudio lists are needed on both paths: the loopback test always uses them
+        try
+        {
+            _nativeInputs = DeviceCatalog.Inputs();
+            _nativeOutputs = DeviceCatalog.Outputs();
+        }
+        catch (Exception e)
+        {
+            _status.Text = $"PortAudio failed to load: {e.Message}";
+            _nativeInputs = _nativeOutputs = [];
+        }
+
         if (_pathPicker.Selected == (int)CapturePath.Native)
         {
-            try
-            {
-                _nativeInputs = DeviceCatalog.Inputs();
-                _nativeOutputs = DeviceCatalog.Outputs();
-            }
-            catch (Exception e)
-            {
-                _status.Text = $"PortAudio failed to load: {e.Message}";
-                return;
-            }
             foreach (var d in _nativeInputs)
                 _devicePicker.AddItem(d.Label);
             var preferred = DeviceCatalog.DefaultInput();

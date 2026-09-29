@@ -73,6 +73,20 @@ public static class DeviceCatalog
             ?? fallback;
     }
 
+    /// <summary>
+    /// The PortAudio input matching a device name from elsewhere (e.g. Godot's
+    /// input list): exact WASAPI name first, then any entry the name prefixes
+    /// (MME truncates names). "Default" or no name means the system default.
+    /// </summary>
+    public static AudioDevice? MatchInput(IReadOnlyList<AudioDevice> inputs, string? name, Func<AudioDevice?> defaultInput)
+    {
+        if (name is null or "Default")
+            return defaultInput();
+        return inputs.FirstOrDefault(d => d.IsWasapi && d.Name == name)
+            ?? inputs.FirstOrDefault(d => d.Name == name)
+            ?? inputs.FirstOrDefault(d => name.StartsWith(d.Name, StringComparison.Ordinal) || d.Name.StartsWith(name, StringComparison.Ordinal));
+    }
+
     public static IReadOnlyList<AudioDevice> Outputs() =>
         All().Where(d => d.MaxOutputChannels > 0).OrderBy(d => d.IsWasapi ? 0 : 1).ThenBy(d => d.Index).ToList();
 

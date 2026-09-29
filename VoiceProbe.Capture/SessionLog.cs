@@ -48,6 +48,8 @@ public sealed class SessionLog : IDisposable
         Write($"{prefix}.overruns", d.OverrunCount);
         Write($"{prefix}.dropped_samples", d.DroppedSamples);
         Write($"{prefix}.frame_queue_overruns", d.FrameQueueOverruns);
+        Write($"{prefix}.capture_gaps", d.CaptureGaps);
+        Write($"{prefix}.capture_to_result.missed", d.CaptureToResultMissed);
         Write($"{prefix}.max_analysis_ms", d.MaxAnalysisTimePerFrame.TotalMilliseconds.ToString("0.000", CultureInfo.InvariantCulture));
         Write($"{prefix}.capture_to_result.count", d.CaptureToResultCount);
         foreach (int p in new[] { 50, 95, 99 })

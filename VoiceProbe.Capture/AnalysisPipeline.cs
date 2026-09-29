@@ -7,7 +7,7 @@ namespace VoiceProbe.Capture;
 /// The live chain from spec §2, assembled: capture writes 48 kHz mono into the
 /// ring, the pump analyzes on its own thread, and consumers read the frame queue
 /// (every frame) or the triple buffer (latest frame). Capture-to-result latency
-/// is recorded for every frame.
+/// is recorded for every frame, and the analyzer resets at every capture gap.
 /// </summary>
 public sealed class AnalysisPipeline : IDisposable
 {
@@ -17,11 +17,12 @@ public sealed class AnalysisPipeline : IDisposable
     {
         Analyzer = new VoiceAnalyzer(config);
         Frames = new FrameQueue(Analyzer.Diagnostics);
-        Pump = new LiveAnalysisPump(Audio, Analyzer, Frames, Latest, Arrivals);
+        Pump = new LiveAnalysisPump(Audio, Analyzer, Frames, Latest, Arrivals, Gaps);
     }
 
     public SpscOverwriteRing<float> Audio { get; } = new(AudioRingCapacity);
     public ArrivalLog Arrivals { get; } = new();
+    public CaptureGapLog Gaps { get; } = new();
     public VoiceAnalyzer Analyzer { get; }
     public FrameQueue Frames { get; }
     public TripleBuffer<AnalysisFrame> Latest { get; } = new();
@@ -31,9 +32,20 @@ public sealed class AnalysisPipeline : IDisposable
     /// <summary>Capture thread only. 48 kHz mono in −1..1. No allocation, no locking.</summary>
     public void Write(ReadOnlySpan<float> samples)
     {
+        if (samples.IsEmpty)
+            return;
+        // log the arrival first: once the audio is published the pump can turn it
+        // into frames immediately, and each frame's arrival must already be findable
+        Arrivals.Record(Audio.PublishedIndex + samples.Length);
         Audio.Write(samples);
-        Arrivals.Record(Audio.PublishedIndex);
     }
+
+    /// <summary>
+    /// Capture thread only: audio was lost (e.g. driver input overflow) just before
+    /// the next sample written. The analyzer resets there instead of analyzing
+    /// across the discontinuity.
+    /// </summary>
+    public void MarkGap() => Gaps.Record(Audio.PublishedIndex);
 
     public void Start() => Pump.Start();
 
@@ -71,6 +83,9 @@ public sealed class CaptureConverter
             _resampled = [];
         }
     }
+
+    /// <summary>Capture thread only: forget stream history after a gap.</summary>
+    public void Reset() => _resampler?.Reset();
 
     /// <summary>Resampler group delay in 48 kHz samples; 0 when not resampling.</summary>
     public double ResamplerDelaySamples => _resampler?.DelayOutputSamples ?? 0;

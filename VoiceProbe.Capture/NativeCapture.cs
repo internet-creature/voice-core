@@ -33,6 +33,7 @@ public sealed unsafe class NativeCapture : IDisposable
 
     private readonly PortAudioSharp.Stream _stream;
     private readonly CaptureConverter _converter;
+    private readonly AnalysisPipeline _sink;
     private readonly PortAudioSharp.Stream.Callback _callback;  // held so the GC can't collect it
     private readonly int _channels;
     private long _callbacks;
@@ -45,6 +46,7 @@ public sealed unsafe class NativeCapture : IDisposable
         Device = device;
         Format = format;
         _channels = format.Channels;
+        _sink = sink;
         _converter = new CaptureConverter(format, sink.Write);
         _callback = OnInput;
 
@@ -85,7 +87,10 @@ public sealed unsafe class NativeCapture : IDisposable
 
     public long Callbacks => Interlocked.Read(ref _callbacks);
 
-    /// <summary>Callbacks where PortAudio reported the driver dropped input.</summary>
+    /// <summary>
+    /// Callbacks where PortAudio reported the driver dropped input. Each one is
+    /// marked as a capture gap, so the analyzer resets instead of analyzing across it.
+    /// </summary>
     public long InputOverflows => Interlocked.Read(ref _inputOverflows);
 
     /// <summary>
@@ -140,7 +145,12 @@ public sealed unsafe class NativeCapture : IDisposable
     {
         Interlocked.Increment(ref _callbacks);
         if ((statusFlags & StreamCallbackFlags.InputOverflow) != 0)
+        {
+            // input was discarded before this buffer: don't join the two sides
             Interlocked.Increment(ref _inputOverflows);
+            _converter.Reset();
+            _sink.MarkGap();
+        }
         if (timeInfo.inputBufferAdcTime > 0 && timeInfo.currentTime >= timeInfo.inputBufferAdcTime)
         {
             Interlocked.Add(ref _driverLatencyMicrosSum, (long)((timeInfo.currentTime - timeInfo.inputBufferAdcTime) * 1e6));
