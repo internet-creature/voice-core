@@ -80,21 +80,29 @@ frame policy (new in v2 — this is what makes grading feel fair):
   - creak while voice is expected: scores as miss frames, but the UI shows
     a creak indicator, not a generic miss — the user should learn what
     happened, not just that it "missed."
-  - low-confidence frames (per VoiceCore confidence fields) are excluded
-    from scoring entirely. if >20% of a run's frames are low-confidence,
-    the run is flagged "tracking unreliable" and not graded. never grade
-    a run the tracker couldn't actually see — a wrong grade costs trust
-    that honest abstention doesn't.
-    "low-confidence" (v2.3) = F0Confidence below the chart's floor,
-    default 0.9. analyzer confidences are calibrated probabilities
-    (analyzer spec §3.9), so 0.9 means "≤ 10% chance this frame's pitch
-    is a gross error." the floor trades wrong grades (too low) against
-    ungraded runs (too high). the analyzer's coverage-at-floor metric
-    measures the second, and the default gets tuned at Gate A,
-    especially on breathy phonation.
+  - unreliable frames are excluded from scoring, per dimension. if a
+    run has too many of them, it isn't graded on that dimension. never
+    grade what the tracker couldn't actually see — a wrong grade costs
+    trust that honest abstention doesn't.
+    "unreliable" (v2.3) depends on which confidence answers the question
+    being scored (analyzer spec §3.9). each is a calibrated probability
+    checked against a per-chart floor, default 0.9:
+      - voicing state (is there voice, creak, or nothing?):
+        VoicingConfidence. a confidently detected Creak or Unvoiced frame
+        is a Miss, not an abstention.
+      - pitch on a Voiced frame: F0Confidence. 0.9 means "≤ 10% chance
+        this frame's pitch is a gross error." F0Confidence doesn't exist
+        for non-Voiced frames and is never consulted for them.
+      - resonance on a Voiced frame: its own validity and confidence
+        rules. high pitch confidence says nothing about F2.
+    the full per-dimension table is in appendix A. the floors trade
+    wrong grades (too low) against ungraded runs (too high). the
+    analyzer's coverage-at-floor metric measures the second, and the
+    defaults get tuned at Gate A, especially on breathy phonation.
 
 chart score = weighted mean of frame accuracy × completion, scaled to 1,000,000
-  (completion = fraction of scoreable chart time with a scoreable attempt)
+  (per dimension: completion = fraction of scoreable chart time with a
+  judged frame on that dimension; see appendix A)
 
 letter thresholds:  D 50%  |  C 65%  |  B 78%  |  A 88%  |  S 95%
 Full Combo = zero Miss segments
@@ -282,7 +290,7 @@ these thresholds are **product requirements and live in this document**. the ana
 - log-frequency pitch line with HDR neon glow
 - resonance as a second visual dimension, redundantly encoded (§1.8)
 - one background theme
-- chart format defined and serialized. a chart is: target contour per scored dimension, vowel, duration, per-dimension judgment windows (defaulting from §1.2), breath/grace marks, dimensions scored, and whether it's a scored-library (absolute) or personalized chart
+- chart format defined and serialized. a chart is: target contour per scored dimension, vowel, duration, per-dimension judgment windows (defaulting from §1.2), breath/grace marks, dimensions scored, per-confidence floors (appendix A), and whether it's a scored-library (absolute) or personalized chart. pitch targets must sit ≥ 100 cents inside the analyzer's search range for that exercise type (v2.3, appendix A)
 
 ### 1c — tutorial campaign
 
@@ -399,10 +407,29 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 
 - **frame values**: Perfect = 1.0, Great = 0.6, Good = 0.3, Miss = 0.0.
 - **miss segments vs miss frames**: miss-quality frames become a *Miss segment* only as part of a ≥5-consecutive-frame run. shorter excursions still score 0.0 per frame, but they do not break Full Combo and are not displayed as Misses — **display and FC track segments; score tracks frames.** no frame is ever double-counted or retroactively rescored.
-- **exclusions**: low-confidence frames and grace-window frames are removed from the accuracy numerator *and* denominator. low-confidence exclusions still count against completion; grace windows don't (they were never scoreable time).
-- **completion** = attempted-and-scoreable frames / (chart frames − grace frames). runs with completion < 60% are shown as "incomplete," ungraded, and cannot set PBs.
-- **unreliable runs**: >20% low-confidence frames → no grade, no PB (§1.2). exclusion is analyzer-driven and cannot be triggered per-frame by the user; paired with the completion rule, going quiet to protect a score just produces an incomplete run.
-- **multi-dimension**: score = Σ wᵢ·scoreᵢ, default weights pitch 0.6 / resonance 0.4, then the floor rule: `final = min(weighted mean, weakest dimension + 0.15)` on the 0–1 accuracy scale. you cannot S-rank with any dimension below ~0.80.
+- **per-frame outcome, per dimension** (v2.3, Astra review). every non-grace frame gets exactly one outcome on each scored dimension. rows are checked top to bottom, and the first match wins. `floor` = the chart's floor for that confidence, default 0.9. all charts so far expect voice for their whole scoreable time.
+
+  | frame (analyzer spec §3.9) | pitch | resonance |
+  |---|---|---|
+  | `VoicingConfidence` < floor | unreliable | unreliable |
+  | Silence | unattempted | unattempted |
+  | Unvoiced or Creak | Miss (creak indicator for Creak, §1.2) | Miss |
+  | Voiced, `F0Range` = Above | Miss | per resonance rows below |
+  | Voiced, `F0Range` = Below, or `F0Confidence` < floor | unreliable | per resonance rows below |
+  | Voiced, `F0Confidence` ≥ floor | judged on cents error | per resonance rows below |
+  | ↳ resonance signal fails validity or its confidence < floor | — | unreliable |
+  | ↳ resonance signal valid and confident | — | judged on its per-dimension error |
+
+  the voicing-state rows mean a *confidently* detected Creak or Unvoiced frame is a Miss, as §1.2 requires. only an uncertain state abstains. pitch and resonance abstain independently: a frame can be pitch-judged and resonance-unreliable. a Voiced frame above the analyzer's ceiling is a Miss. the analyzer detects that case directly (analyzer spec §3.4), and charts must be authored ≥ 100 cents inside the search range, so the pitch is always a full Miss window off target. `Below` comes from a weaker fallback signal, so it abstains. resonance validity and confidence are whatever the Gate B signal ships with (analyzer spec §3.9, §1.5 here).
+- **exclusions**: unreliable frames and grace-window frames are removed from that dimension's accuracy numerator *and* denominator. unreliable frames still count against completion. grace windows don't, since they were never scoreable time.
+- **completion**, per dimension = judged frames (Misses included) / (chart frames − grace frames). unattempted and unreliable frames both lower it. a run where any graded dimension has completion < 60% is shown as "incomplete," ungraded, and cannot set PBs.
+- **unreliable runs**, per dimension: >20% unreliable frames (of chart frames − grace frames) on a dimension means that dimension is "tracking unreliable."
+  - pitch unreliable → no grade, no PB (§1.2), whatever resonance did.
+  - resonance unreliable, pitch fine → graded on pitch only. it's labeled "pitch-only run — resonance tracking unreliable" and cannot set PBs on multi-dimension charts. this is the same treatment as vowel mismatch.
+
+  exclusion is analyzer-driven and cannot be triggered per-frame by the user. paired with the completion rule, going quiet to protect a score just produces an incomplete run.
+- **per-dimension score** = accuracy (mean frame value over judged frames) × completion, on a 0–1 scale.
+- **multi-dimension**: score = Σ wᵢ·scoreᵢ, default weights pitch 0.6 / resonance 0.4, then the floor rule: `final = min(weighted mean, weakest dimension + 0.15)` on the 0–1 scale. you cannot S-rank with any dimension below ~0.80.
 - **vowel mismatch** (§1.6): the resonance dimension is dropped, the run is graded on pitch only, labeled "pitch-only run," and cannot set PBs on multi-dimension charts.
 - **PB provenance**: every PB stores `(chartVersion, scoringVersion, analyzerVersion)`. a change to any of the three archives existing PBs (still visible, labeled with their version) and starts fresh — rule changes never silently compare against old numbers, in either direction.
 
@@ -421,7 +448,8 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 **v2.3 (2026-09-28, paired with analyzer spec v2.3):**
 
 - **resonance**: specificity added as a §1.5 validation criterion and a Gate B requirement, because a brightness proxy confounded with spectral tilt would reward pressed phonation (a §1.9 violation) and score lighter phonation as darker. added a risk row. added a formant-confidence caveat for high f0 on the measured-truth layer.
-- **confidence and latency**: "low-confidence" defined as F0Confidence below a per-chart floor (default 0.9) on calibrated analyzer confidences (§1.2). Gate A adds breathy-slice coverage. the Gate B capture-to-result threshold becomes < 10 ms under the analyzer's clarified definition, where the old < 25 ms sat on an ambiguity.
+- **confidence and latency**: "low-confidence" defined against per-chart floors (default 0.9) on calibrated analyzer confidences (§1.2, appendix A). Gate A adds breathy-slice coverage. the Gate B capture-to-result threshold becomes < 10 ms under the analyzer's clarified definition, where the old < 25 ms sat on an ambiguity.
 - **reference tones**: added as an open decision with options, plus a risk row.
 - **capture path**: the comparison moves into phase 0 via the Godot probe (1a).
+- **per-dimension abstention** (Astra review): the single "F0Confidence below floor" rule is replaced by a per-dimension outcome table (appendix A). `VoicingConfidence` decides state judgments, so a confident Creak or Unvoiced frame is a Miss instead of an exclusion. `F0Confidence` decides voiced pitch. resonance has its own validity and confidence rules. completion and the unreliable-run rule are per dimension. an unreliable resonance lane downgrades the run to pitch-only instead of voiding it. above-ceiling f0 is a Miss, and chart pitch targets must sit ≥ 100 cents inside the search range (1b).
 - **housekeeping**: `SpectralTiltDbPerKhz` noted for the weight meter (§1.4). cross-references fixed: §1.2's safe-range gate → §1.9, §1.3's perception model → §1.11. spec references renamed to the unversioned `voice-analysis-spec.md`, since version history now lives in git.

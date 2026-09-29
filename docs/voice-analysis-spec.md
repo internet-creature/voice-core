@@ -246,36 +246,45 @@ descending glides and the bottom of range generate a lot of creak in practice se
 
 - buffer **2048 samples** (42.7 ms @ 48 kHz), timestamped at center
 - search range **60–1000 Hz** → lag τ from 48 to 800 samples. (v2.3: v2 capped the range at 600 Hz, but warm-up sirens go above that for many voices and the trace would drop out at the top. the safe-range gate should limit what charts ask for, not the tracker. a higher ceiling adds octave-up candidates for every voice, so the sweep suite adds octave-up bait (below). if the corpus shows more octave-up errors at the higher ceiling, fall back to per-exercise ceilings: 600 Hz for speech charts, 1000 Hz for sirens. configs are immutable, so the game builds one analyzer per exercise type.)
-- **exact difference function, fixed integration window** (this is where FFT shortcuts go wrong):
+- **exact difference function, fixed integration window, centered on the buffer:**
 
   ```
   buffer B = 2048, max lag τmax = 800, integration length W = B − τmax = 1248
   (26 ms — longer than the longest period searched, 16.7 ms at 60 Hz)
 
-  d(τ) = Σ_{j=0}^{W−1} (x[j] − x[j+τ])²        for τ = 0..τmax
-       = E(0, W) + E(τ, τ+W) − 2·R(τ)
-
-  E(a, b) = Σ_{j=a}^{b−1} x[j]²     (one cumulative-sum array serves every τ)
-  R(τ)    = Σ_{j=0}^{W−1} x[j]·x[j+τ]
+  h(τ) = B/2 − ⌊(W + τ)/2⌋                     (start of the compared pair)
+  d(τ) = Σ_{j=0}^{W−1} (x[h+j] − x[h+j+τ])²     for τ = 1..τmax
   ```
 
-  R(τ) via FFT: cross-correlate the first W samples against the whole buffer. zero-pad both to **4096** (≥ B + W − 1 = 3295, so no circular wraparound) and compute `IFFT(conj(FFT(head)) · FFT(buffer))`. the naive `2(R(0) − R(τ))` form is biased because window energy changes with lag. use the three-term form above.
+  the two compared windows together span `[h, h + τ + W)`, whose center sits within half a sample of the buffer center for every τ. at τmax, h = 0 and the pair fills the buffer exactly.
 
   **why a fixed window (v2.3):** v2 summed over `2048 − τ` terms, so d(τ) shrank at longer lags just because it had fewer terms. the YIN paper (de Cheveigné & Kawahara 2002) uses a fixed integration window to avoid exactly this. the shrinking sum favors long lags, which means octave-down errors. that bias only matters where 2τ fits inside the search range (f0 above ~120 Hz), so it lands on higher voices. it bites hardest when no dip clears the 0.15 threshold (breathy or noisy frames) and the global-minimum fallback decides.
 
+  **why centered (v2.3, Astra review):** the first v2.3 draft compared a fixed head `x[0..W)` against `x[τ..τ+W)`. that pair is centered at `(W + τ)/2`, not at the buffer center, so the moment being measured moved with the detected period. on a 2400 cents/s glide, a frame timestamped at 300 Hz read 297.31 Hz (−15.6 cents). the error grows with glide rate and period, it leaks into reference comparisons and scoring, and it breaks the fixed-`AlgorithmicDelaySamples` claim in §1.1. the centered placement above measures 300.09 Hz (+0.5 cents) on the same glide.
+
+  **compute it directly.** the centered placement means each lag uses a different window, so the single-FFT cross-correlation shortcut no longer applies. the direct sum is W·τmax ≈ 1 M multiply-adds per hop (~100 M/s). with `System.Numerics.Vector<float>` (8 lanes on AVX2) that's a few percent of one core. accumulate in float32 SIMD lanes and reduce in float64. **measure it at step 4** against the Gate B capture-to-result budget. if it doesn't fit (Steam Deck included), the fallback is the one-sided FFT form plus an explicit per-frame timestamp correction of `(W + τ)/2 − B/2` samples, and the glide tests below then gate that correction. a scalar float64 version of the same formula stays in `VoiceCore.Tests` as the **test oracle**, checked against the SIMD d(τ) on random and synthetic buffers.
+
 - cumulative mean normalized difference `d′(τ) = d(τ)·τ / Σ_{j=1..τ} d(j)`, `d′(0) = 1`
-- absolute threshold 0.15 — take the **first** local minimum below it; if none, take the global minimum and mark low confidence
+- absolute threshold 0.15 — take the **first** local minimum below it, searching from **τ = 2**, not from τmin (see "out-of-range fundamentals" below); if none, take the global minimum within `[τmin, τmax]` and mark low confidence
 - parabolic interpolation over the three points around the minimum for sub-sample lag
 - output `f0RawHz` (always, per §3.3), and `f0Cents = 1200 · log2(f0 / 55.0)` — fixed 55 Hz anchor so the number is stable across sessions
 
-ship the FFT version. the naive direct sum is W·τmax ≈ 1 M multiply-adds per hop (~100 M/s), and the FFT version is roughly an order of magnitude cheaper. the naive version stays useful as a **test oracle**: keep it in `VoiceCore.Tests` and assert that the FFT d(τ) matches it within float tolerance on random and synthetic buffers.
+**out-of-range fundamentals (v2.3, Astra review).** a search that starts at τmin can't see a fundamental above the ceiling, but it can see that fundamental's multiples. a clean 1100 Hz sine has a period of 43.6 samples, just under τmin = 48, but two periods (87.3 samples) land inside the range with d′ ≈ 0. that frame then published as **550.03 Hz Voiced** with near-zero aperiodicity: a confident, folded wrong answer. so d(τ) is computed from τ = 2 (46 extra lags, ~6% more work), and the first-dip search runs from there:
+
+- first qualifying dip at τ < τmin → the fundamental is above the ceiling. the frame is still classified on its aperiodicity as usual (§3.3), but `F0Hz` = NaN and `F0Range = Above`. no in-range multiple is ever accepted in its place. `F0RawHz` logs the true out-of-range estimate.
+- τ = 2 corresponds to 24 kHz, so any tone below Nyquist that could fold into the range is caught. a 300 Hz harmonic complex with a strong 2nd harmonic still reads 300 Hz, because a voice has no periodicity at lags shorter than its period.
+- below the floor (period > τmax) there is no in-range multiple to fold onto. a sub-60 Hz fundamental shows up as a missing or unstable candidate, which is the creak path (§3.3). `F0Range = Below` is set only when the global-minimum fallback lands at τmax, which is what a period too long to fit looks like.
+- **STABLE** (§3.3) and the octave-correction median (§3.5) ignore out-of-range frames, and a hysteresis hold never publishes a folded value.
+- the game treats confident-voiced `F0Range = Above` as a pitch Miss, not an abstention (game doc appendix A). the tracker saw the voice; it's just far past any chart target, since charts are authored ≥ 100 cents inside the search range. `Below` is a weaker signal, and the game abstains on it.
 
 **validation (replaces v1's single sine test):**
 
 - smoke test: synthesized 200 Hz sine → within ±2 cents. (demanding exactly 200.00 tests float trivia, not the algorithm.)
 - sweep suite: sines and harmonic complexes at 60–1000 Hz in ~10% steps × several phases × amplitudes from −40 to −3 dBFS × with/without additive noise at 20 dB SNR. gate: ±5 cents on clean tones, and no octave errors on harmonic complexes with strong 2nd harmonics or a weak fundamental (octave-up bait, which matters more now the ceiling is 1000 Hz).
 - breathy suite (v2.3): harmonic complexes at 150–400 Hz with steep spectral tilt plus aspiration-like noise, harmonics-to-noise ratio from 10 dB down to 0 dB. gate at HNR ≥ 5 dB: classified Voiced (via the breathy path, §3.3) once past onset, with no octave-down errors. 0–5 dB is reported but not gated, since that's where breathy phonation shades into whisper. this is the combined test for the breathy path and the fixed-window difference function.
-- endpoint tests at exactly 60 and 1000 Hz, and just outside the range (55, 1100 Hz → low confidence or unvoiced, never a folded wrong answer).
+- endpoint tests at exactly 60 and 1000 Hz, and just outside the range. 55 Hz → `F0Range = Below`, low confidence, or not Voiced. 1100, 1500 and 3000 Hz sustained sines and harmonic complexes → `F0Range = Above` with `F0Hz` = NaN. none of them may publish a folded value (e.g. 550 Hz for an 1100 Hz tone).
+- ceiling-crossing glides (v2.3): sines and harmonic complexes gliding 800 → 1400 → 800 Hz at 1200 and 2400 cents/s. every frame is either within ±5 cents of the true f0 (in range) or `F0Range = Above` (out of range). a frame that publishes a fold is a failure.
+- **timestamp alignment (v2.3):** linear-in-cents glides at ±600, ±1200 and ±2400 cents/s, across 100–900 Hz. the published `F0Hz` must match the synthesized instantaneous f0 at `WindowCenterSample` within ±5 cents at every rate, with no trend in error vs period. this test catches any off-center window. it also re-checks `AlgorithmicDelaySamples` from outside, by cross-correlating the published track against the known contour.
 
 ### 3.5 octave error correction
 
@@ -285,7 +294,8 @@ this is where naive implementations quietly fail. budget real time here.
 1. keep a running median of the last 5 valid f0Cents values
 2. if |cents[n] − runningMedian| is between 1100 and 1300:
      - evaluate d′(τ/2) and d′(τ·2), skipping any lag outside the
-       search range (τ·2 > 800 whenever f0 < 120 Hz)
+       search range (τ·2 > 800 whenever f0 < 120 Hz). if τ/2 < τmin
+       wins, the frame becomes F0Range = Above (§3.4), never a fold
      - if the alternate candidate's d′ is within 0.05 of the chosen one,
        prefer the candidate closer to the running median
 3. median filter, width 5:
@@ -339,8 +349,30 @@ the game's resonance lane may end up driven by something more robust than live L
 **the raw proxy is confounded with spectral tilt (v2.3).** centroid and band ratios rise whenever the spectral tilt flattens, and tilt flattens with vocal effort and with heavier, more pressed phonation. a raw brightness score therefore rewards pushing harder. that makes it a strain incentive in a product whose safety section forbids one (game doc §1.9). it also runs backwards for a common goal: lighter phonation steepens the tilt and reads *darker*. the proxy also rises with f0. so:
 
 - **specificity is a gate criterion.** the corpus gains cross-talk tasks (§6): pitch, loudness and vocal weight each varied while tract posture is held fixed. the proxy must move more for a posture contrast than for any of those. report the ratio.
-- **a tilt-normalized variant is scored alongside the raw one.** fit a least-squares line to the log-power spectrum over 100 Hz–4 kHz, subtract it, then compute the centroid or band ratio on the residual. the variant is an `AnalysisConfig` choice (configs are immutable), so batch runs the corpus once per variant and the better one survives.
+- **a tilt-normalized variant is scored alongside the raw one.** the variant is an `AnalysisConfig` choice (configs are immutable), so batch runs the corpus once per variant and the better one survives.
 - **the fitted slope is published as `SpectralTiltDbPerKhz`** (experimental). it costs nothing once the normalization fit exists, and it is a starting input for the game's unscored weight meter (game doc §1.4).
+
+**computation (v2.3, Astra review).** the first v2.3 draft computed the centroid directly on the detrended dB residual. a least-squares residual is signed and sums to zero over the fitted bins, so the centroid's denominator is ~0 and the result is undefined or unstable. band sums of dB residuals aren't energies either. residuals go back to linear power before anything is summed:
+
+```
+spectrum    reuse the CPP power spectrum (§3.8): 40 ms Hamming on the 48 kHz
+            signal, same 10 ms grid. bin k at frequency f_k.
+floor       P_k ← max(P_k, 1e−12)             (−120 dB, same floor as CPP)
+analysis    bins with 100 Hz ≤ f_k < 4000 Hz, for BOTH variants
+band        low  = 100 Hz–1 kHz,   high = 1–4 kHz
+
+raw:        Q_k = P_k
+normalized: L_k = 10·log10(P_k)
+            fit L_k ≈ a + b·f_k by least squares over the analysis bins
+            r_k = L_k − (a + b·f_k)          (signed residual, dB)
+            Q_k = 10^(r_k / 10)              (positive linear power, flattened)
+            SpectralTiltDbPerKhz = 1000·b
+
+centroid    = Σ f_k·Q_k / Σ Q_k               over analysis bins, in Hz
+band ratio  = 10·log10(Σ_high Q_k / Σ_low Q_k), in dB
+```
+
+`BrightnessProxy` publishes the centroid or the band ratio, whichever the config selects, so the raw/normalized × centroid/ratio grid is four configs. the proxy is NaN unless the frame is Voiced and not clipping. whether a published value is reliable enough to score is a separate question, covered by the resonance rules in §3.9. the fit weights every bin equally, including the harmonic valleys. at high f0 the valleys sink toward the floor and can tilt the fit. if the corpus shows `SpectralTiltDbPerKhz` tracking f0 at fixed posture, fit to per-harmonic peaks (located from `F0Hz`) instead.
 
 ### 3.8 voice quality (rescoped in v2)
 
@@ -356,18 +388,22 @@ the game's resonance lane may end up driven by something more robust than live L
 
 ### 3.9 confidence: defined and calibrated (new in v2.3)
 
-the game abstains based on confidence. low-confidence frames aren't scored, and a run with >20% of them isn't graded (game doc §1.2). v2 published `F0Confidence` and `VoicingConfidence` without defining either, and a threshold on an undefined number is a guess. so:
+the game abstains based on confidence. frames it can't trust aren't scored, and a run with too many of them isn't graded (game doc §1.2, appendix A). v2 published `F0Confidence` and `VoicingConfidence` without defining either, and a threshold on an undefined number is a guess. so:
 
-- **meaning.** published confidences are calibrated probabilities:
-  - `F0Confidence` = P(`F0Hz` is not a gross error, i.e. within 20% of reference | frame published Voiced)
-  - `VoicingConfidence` = P(the published voicing state matches the reference label)
+- **meaning.** published confidences are calibrated probabilities, and each one answers a different question:
+  - `VoicingConfidence` = P(the published voicing state matches the reference label). defined for **every** frame and every state. calibrated **per published state**, since Creak, Unvoiced and Voiced have very different base rates and error patterns. this is the confidence that lets the game call a confidently detected Creak or Unvoiced frame a Miss rather than an abstention.
+  - `F0Confidence` = P(`F0Hz` is not a gross error, i.e. within 20% of reference | frame published Voiced). defined **only for Voiced frames** with `F0Range = In`. NaN otherwise. it says nothing about Creak or Unvoiced frames.
+  - resonance: see below. **pitch confidence is not resonance confidence.** a frame can have a certain f0 and a missing or wrong F2.
 
-  a game floor of 0.9 then means "expect ≤ 10% gross errors among the frames that get scored."
+  a game floor of 0.9 on `F0Confidence` then means "expect ≤ 10% gross pitch errors among the Voiced frames that get pitch-scored."
 - **raw score.** before calibration, each confidence is a raw score built from evidence the analyzer already has. for f0: 1 − d′ at the chosen lag, candidate stability (§3.3), level above the noise floor, and whether octave correction stepped in. for voicing: distance from the nearest classification threshold, plus hysteresis state.
 - **calibration.** fit a monotone map from raw score to probability on the **dev split** (isotonic regression or binned), then check it on held-out (§6). the calibration table is part of `AnalysisConfig`, so the config hash covers it. recalibrating bumps `AnalyzerVersion`, so the game's PB provenance rule (game doc appendix A) archives old PBs instead of comparing across calibrations.
 - **before step 5** there's no corpus to calibrate against. the raw score is published, and the config records `ConfidenceCalibration = none` so nothing downstream mistakes it for a probability.
 
-`FormantConfidence` follows the same pattern once formant references exist (step 7).
+**resonance validity and confidence (v2.3, Astra review).** resonance gets its own rules, independent of `F0Confidence`:
+
+- **validity** (a hard gate, before any confidence): the frame is Voiced, not clipping, and the signal the resonance lane uses is non-NaN. for formants, that's the specific formant(s) the lane reads (e.g. F2, or F1–F4 for dispersion), each individually valid per §3.6. for the proxy, it's `BrightnessProxy`.
+- **confidence:** `FormantConfidence` = P(each formant the lane uses is within the formant-error tolerance of reference | valid), calibrated the same way once formant references exist (step 7). the Gate B decision (game doc §1.5) must ship the chosen signal with a confidence defined and calibrated like this. for the proxy, the reference is the formant measurement it's validated against. until one is calibrated, a resonance frame counts as reliable only if it passes validity, its level clears the §3.3 gate by ≥ 6 dB (a starting guess), and `VoicingConfidence` clears the floor. the config's `ConfidenceCalibration = none` tells the game this is a rule, not a probability.
 
 ---
 
@@ -375,6 +411,7 @@ the game abstains based on confidence. low-confidence frames aren't scored, and 
 
 ```csharp
 public enum VoicingState : byte { Silence, Unvoiced, Voiced, Creak }
+public enum F0Range      : byte { In, Above, Below }
 
 public readonly record struct AnalysisFrame
 {
@@ -392,7 +429,8 @@ public readonly record struct AnalysisFrame
     public float  F0Hz                 { get; init; }  // published; NaN unless Voiced
     public float  F0DisplayHz          { get; init; }  // causal median + slew; NaN unless Voiced
     public float  F0Cents              { get; init; }  // re 55 Hz, from F0Hz
-    public float  F0Confidence         { get; init; }  // calibrated probability, §3.9
+    public float  F0Confidence         { get; init; }  // calibrated probability, §3.9; NaN unless Voiced and F0Range == In
+    public F0Range F0Range             { get; init; }  // In | Above | Below, §3.4
     public float  Aperiodicity         { get; init; }  // YIN d′ at chosen lag
 
     // level
@@ -488,9 +526,10 @@ Praat agreement can just mean two systems share the same assumptions, especially
 | voicing P/R | precision & recall for Voiced, and for Creak vs hand labels | |
 | formant error | mean \|F − F_ref\| per formant (F1–F4 each), voiced frames | F3/F4 gated too — resonance estimates depend on them. reported per f0 band (§3.6) |
 | confidence calibration | per confidence bin: predicted vs observed non-GPE rate; expected calibration error | v2.3, §3.9. scored on held-out |
-| coverage at floor | % of ref-voiced frames published Voiced with F0Confidence ≥ floor, at floors 0.5 / 0.8 / 0.9 | v2.3. the number of frames the game will actually be allowed to score. an analyzer can post a good GPE by marking hard frames low-confidence; this metric catches it |
+| coverage at floor | % of ref-voiced frames published Voiced with both VoicingConfidence and F0Confidence ≥ floor, at floors 0.5 / 0.8 / 0.9. resonance coverage is reported separately with the resonance validity rules (§3.9) | v2.3. the number of frames the game will actually be allowed to score. an analyzer can post a good GPE by marking hard frames low-confidence; this metric catches it |
+| out-of-range folds | % of frames with ref f0 outside the search range that publish an in-range F0Hz | v2.3, §3.4. target 0 on synthetic, reported on real |
 | resonance specificity | proxy/formant change for a posture contrast ÷ change for pitch, loudness, and weight contrasts (each separately) | v2.3, §3.7b. cross-talk tasks |
-| p95 capture-to-result | measured (§3.1 definition) | |
+| p95 capture-to-result | measured (§3.1 definition) | includes the direct-sum YIN cost (§3.4) |
 | user-to-photon | measured, camera test | reported, not gated in phase 0 |
 
 **aspirational targets** (clean-slice): GPE < 2%, FPE < 15 cents, VDE < 5%, F1/F2 error < 60 Hz. but:
@@ -553,7 +592,7 @@ do not reorder these. each one de-risks the next. (v1's order had YIN before the
 1. **streaming skeleton + timing model.** `VoiceAnalyzer` shell, ring buffer, frame queue, timestamps, `Reset`, diagnostics counters. chunk-boundary invariance test passes on a passthrough "analyzer."
 2. **synthetic signal generator + test harness.** sines, harmonic complexes, glides, noise mixes, breathy signals (§3.4). this is infrastructure for every later gate.
 3. **capture → RMS meter** in the Godot probe. confirms devices work and exercises the format policy. measure loopback latency now, and run the camera test once for a baseline. start the native-vs-`AudioEffectCapture` comparison here, since the probe can host both.
-4. **YIN (causal) + voicing state machine**, with the naive-sum oracle test. validate against the synthetic sweep and breathy suites, then against Praat on a few recorded files. **then add a live scrolling log-frequency pitch trace to the probe** (v2.3). it's the first thing in the build a person would use, it makes every later bug visible by eye, and your own practice through it seeds the debug corpus. this is not step 8 early. step 8 tests *two* dimensions together, which needs step 7.
+4. **YIN (causal) + voicing state machine**, with the float64 oracle test. validate against the synthetic sweep, breathy, out-of-range, and timestamp-alignment suites (§3.4), then against Praat on a few recorded files. measure the direct-sum cost on the slowest target (Steam Deck) and decide here whether the FFT-plus-correction fallback is needed. **then add a live scrolling log-frequency pitch trace to the probe** (v2.3). it's the first thing in the build a person would use, it makes every later bug visible by eye, and your own practice through it seeds the debug corpus. this is not step 8 early. step 8 tests *two* dimensions together, which needs step 7.
 5. **batch mode + 20-file debug corpus + metrics script.** ← get here before formants and before octave-correction tuning. the metrics tell you whether anything works. the debug corpus can be your own sessions plus public references (§6). fit the first confidence calibration here (§3.9).
 6. **octave correction + creak, tuned against the corpus.** grow the corpus (first paid session fits here, see §6 recording sources); add hand labels for the hard subset; design and validate the subharmonic rule (§3.3).
 7. **formants + resonance + brightness proxy (§3.7b).** re-run metrics with F1–F4 gates; score formants and both proxy variants on the resonance-manipulation and cross-talk tasks.
@@ -578,9 +617,16 @@ new in v2 beyond both: level gate lowered to +8 dB with soft-phonation corpus co
 v2.3 (2026-09-28, fresh-eyes review before any code):
 
 - **voicing**: breathy path (stable f0 candidate + elevated aperiodicity → Voiced, reduced confidence), because v2 would have filed breathy phonation as Creak or Unvoiced. v2's subharmonic test was non-discriminating and is now logged-only until step 6. ZCR defined. what gets published during a hysteresis hold is defined (§3.3).
-- **YIN**: fixed-integration-window difference function per the YIN paper, because v2's shrinking sum biased toward octave-down errors on higher voices. search ceiling 1000 Hz for sirens, with a fallback to 600 Hz per exercise. naive-sum test oracle. breathy and octave-up test suites (§3.4). the octave-correction lag range is bounded (§3.5).
+- **YIN**: fixed-integration-window difference function per the YIN paper, because v2's shrinking sum biased toward octave-down errors on higher voices. search ceiling 1000 Hz for sirens, with a fallback to 600 Hz per exercise. float64 test oracle. breathy and octave-up test suites (§3.4). the octave-correction lag range is bounded (§3.5).
 - **confidence**: defined as calibrated probabilities, fit on dev and checked on held-out, versioned with the config. the metrics add calibration and coverage-at-floor (§3.9, §6). Gate A adds breathy-slice coverage (§8).
 - **plumbing**: frame queue alongside the triple buffer, so traces and scoring see every frame (§2). capture-to-result measured from the frame's last sample (§3.1, §5). `MaxFramesFor` output-capacity contract (§1.1).
 - **resonance**: the brightness proxy's confound with spectral tilt/effort is spelled out as a strain incentive. specificity is a gate criterion with cross-talk corpus tasks. a tilt-normalized variant is added. `SpectralTiltDbPerKhz` is published (§3.7b). LPC degradation at high f0 is noted, and metrics are sliced by f0 band (§3.6, §6).
 - **corpus**: real recordings are the product gate. a recording-sources section covers paid voice actors (one actor = one speaker; record multiple devices at once), own sessions, volunteers, and public laryngograph-referenced corpora with license checks. trans and mid-transition voices are named as coverage (§6).
 - **project**: the probe moves from Avalonia to Godot. MathNet is replaced by a preallocated root finder (it allocated per call, breaking §1.1). the TFM note covers .NET 8 end of support (§1, §1.2). build order: live pitch trace at step 4, capture-path comparison at step 3 (§8).
+
+v2.3 fixes from the Astra review (numerically checked with small probes; no implementation existed yet):
+
+- **YIN window centering**: the first draft's fixed head window put the measured moment at `(W + τ)/2`, not the buffer center. that cost −15.6 cents on a 2400 cents/s glide at 300 Hz and made the algorithmic delay depend on pitch. the compared pair is now centered on the buffer for every lag. it's computed as a SIMD direct sum, since the single-FFT shortcut no longer applies, with an FFT-plus-timestamp-correction fallback if step 4 profiling says so. timestamp-alignment glide tests added (§3.4).
+- **out-of-range fundamentals**: a search starting at τmin accepted in-range multiples of out-of-range periods. a clean 1100 Hz sine published as 550.03 Hz Voiced. the first-dip search now starts at τ = 2, and above-ceiling frames publish `F0Hz` = NaN with a new `F0Range` field. out-of-range and ceiling-crossing tests and an out-of-range-fold metric added (§3.4, §3.5, §4, §6).
+- **tilt-normalized proxy**: the centroid was computed on signed dB residuals, which sum to zero. residuals now go back to linear power before any centroid or band sum. the spectrum, bands, and −120 dB floor are specified (§3.7b).
+- **confidence per dimension**: `VoicingConfidence` is defined for every state and calibrated per state. `F0Confidence` is defined only for in-range Voiced frames. resonance gets separate validity and confidence rules. coverage-at-floor requires both voicing and f0 confidence (§3.9, §6).
