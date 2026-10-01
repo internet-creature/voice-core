@@ -43,8 +43,9 @@ Open `VoiceProbe/project.godot` in the Godot editor and press Play. Then:
   - The readout shows Hz, the nearest note ± cents, and the confidence (a calibrated probability: P(not a gross pitch error), spec §3.9).
   - This is the tracker's raw output, with no smoothing yet (step 6), so glitches are visible on purpose.
 - **Calibrate noise floor:** press it and stay quiet for 2 seconds (spec §3.2). The result is saved per device. The level trace shows the floor and the voicing gate.
-- **Record audio:** off at the start of every session, with a red ● REC timer while on (spec §0).
-  - Recordings go to `%APPDATA%/Godot/app_userdata/VoiceProbe/recordings/`, each with a `.txt` sidecar (device, format, noise floor, analyzer version).
+- **● Record** (or the R key), next to Start: one click opens the mic if needed and starts recording, and the button turns red with a timer. The next click stops recording and leaves the mic running. Nothing is recorded unless you click it in this session (spec §0).
+  - Recordings go to `%APPDATA%/Godot/app_userdata/VoiceProbe/recordings/` as `rec-<time>-<mic>.wav`, each with a `.txt` sidecar (device, format, noise floor, analyzer version).
+  - **Two mics at once** (spec §6: one performance, several devices): open the probe twice and pick a different mic in each. The window title shows each window's mic, and the mic in the filename keeps the recordings apart.
   - "Delete all recordings" removes them after a confirmation.
 - **Diagnostics tab:** capture-to-result (Gate B requires p95 < 10 ms), overruns, capture gaps, and the capture path comparison (Native vs Godot).
 - **Latency tests tab:**
