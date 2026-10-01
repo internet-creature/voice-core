@@ -2,13 +2,17 @@ using System.Diagnostics;
 using System.Globalization;
 using VoiceCore;
 using VoiceCore.Batch;
+using VoiceCore.Batch.Corpus;
 using VoiceCore.Synthetic;
 
-// batch mode proper lands at build step 5 (spec §6): it runs VoiceCore over a WAV
-// corpus through the same streaming path and emits per-frame Parquet plus a
-// summary CSV. until then this only exports synthetic suite signals.
+// batch mode (spec §6): synthetic suite export, single-file analysis, and the
+// corpus commands (build step 5), which run every corpus file through the same
+// streaming path as live capture and score it against its reference.
 switch (args)
 {
+    case ["corpus", .. var rest]:
+        return CorpusCommands.Run(rest);
+
     case ["synth", "list", .. var filter]:
         foreach (var c in Suites.All().Where(c => filter.Length == 0 || c.Name.StartsWith(filter[0], StringComparison.Ordinal)))
             Console.WriteLine(c.Name);
@@ -42,7 +46,7 @@ switch (args)
                                                        per-frame CSV through the streaming path; the noise
                                                        floor comes from --floor, else the recording's
                                                        .txt sidecar, else the config default
-            corpus batch mode arrives at build step 5.
+              VoiceCore.Batch corpus ...               debug corpus: add, run, accept, calibrate (docs/corpus.md)
             """);
         return 1;
 }

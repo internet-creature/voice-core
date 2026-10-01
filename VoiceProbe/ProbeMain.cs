@@ -264,11 +264,12 @@ public partial class ProbeMain : Control
         }
     }
 
-    private static string Readout(in AnalysisFrame f) => f.Voicing switch
+    private string Readout(in AnalysisFrame f) => f.Voicing switch
     {
         VoicingState.Voiced when f.F0Range == F0Range.Above => "above the tracker's range",
         VoicingState.Voiced when float.IsFinite(f.F0Hz) =>
-            $"{f.F0Hz,6:0.0} Hz   {NoteNames.Of(f.F0Hz)}   confidence {f.F0Confidence:0.00} (raw, uncalibrated)",
+            $"{f.F0Hz,6:0.0} Hz   {NoteNames.Of(f.F0Hz)}   confidence {f.F0Confidence:0.00}"
+            + (_config.Calibration is null ? " (raw, uncalibrated)" : ""),
         VoicingState.Voiced => "voiced, no pitch",
         VoicingState.Creak => "creak",
         VoicingState.Unvoiced => "unvoiced",

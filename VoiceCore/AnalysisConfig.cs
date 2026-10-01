@@ -19,13 +19,20 @@ public sealed record AnalysisConfig
 {
     public static AnalysisConfig Default { get; } = new();
 
-    public string AnalyzerVersion { get; init; } = "0.2.0";
+    public string AnalyzerVersion { get; init; } = "0.3.0";
 
     /// <summary>
-    /// "none" until a calibration table is fit on the corpus (spec §3.9, build
-    /// step 5). Tells consumers that confidences are raw scores, not probabilities.
+    /// The confidence calibration fit on the corpus (spec §3.9, build step 5), or
+    /// null for raw scores. Refitting it bumps <see cref="AnalyzerVersion"/>, so the
+    /// game's PB provenance rule never compares across calibrations.
     /// </summary>
-    public string ConfidenceCalibration { get; init; } = "none";
+    public ConfidenceCalibrationTable? Calibration { get; init; } = FittedCalibration.Table;
+
+    /// <summary>
+    /// The calibration's name, or "none": confidences are raw scores, not
+    /// probabilities. Stamped into session logs and run summaries.
+    /// </summary>
+    public string ConfidenceCalibration => Calibration?.Name ?? "none";
 
     // --- preprocessing (§3.2) ---
 
@@ -106,7 +113,8 @@ public sealed record AnalysisConfig
             $"HysteresisFrames={HysteresisFrames}",
             $"F0SearchMinHz={F(F0SearchMinHz)}",
             $"F0SearchMaxHz={F(F0SearchMaxHz)}",
-            $"YinThreshold={F(YinThreshold)}");
+            $"YinThreshold={F(YinThreshold)}",
+            $"Calibration={Calibration?.Canonical() ?? "none"}");
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
     }
 
@@ -114,6 +122,8 @@ public sealed record AnalysisConfig
     {
         if (string.IsNullOrWhiteSpace(AnalyzerVersion))
             throw new ArgumentException("AnalyzerVersion must be set.");
+        if (Calibration is not null && string.IsNullOrWhiteSpace(Calibration.Name))
+            throw new ArgumentException("A confidence calibration must be named.");
 
         // every float first: NaN fails every comparison, so without this a NaN
         // threshold slips through and silently disables voicing (Sol review)

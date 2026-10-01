@@ -173,7 +173,14 @@ public class VoiceAnalyzerTests
         Assert.Equal(baseline.ComputeContentHash(), new AnalysisConfig().ComputeContentHash());
         Assert.NotEqual(baseline.ComputeContentHash(), (baseline with { DcFilterPole = 0.99f }).ComputeContentHash());
         Assert.NotEqual(baseline.ComputeContentHash(), (baseline with { AnalyzerVersion = "0.1.1" }).ComputeContentHash());
-        Assert.NotEqual(baseline.ComputeContentHash(), (baseline with { ConfidenceCalibration = "v1" }).ComputeContentHash());
+        var table = new ConfidenceCalibrationTable { Name = "t", F0 = new CalibrationMap([0f, 1f], [0.2f, 0.9f]) };
+        var calibrated = baseline with { Calibration = table };
+        Assert.NotEqual(baseline.ComputeContentHash(), calibrated.ComputeContentHash());
+        // every knot is covered, not just the name
+        Assert.NotEqual(calibrated.ComputeContentHash(),
+            (baseline with { Calibration = table with { F0 = new CalibrationMap([0f, 1f], [0.2f, 0.95f]) } }).ComputeContentHash());
+        Assert.NotEqual(calibrated.ComputeContentHash(),
+            (baseline with { Calibration = table with { Voiced = new CalibrationMap([0.5f], [0.9f]) } }).ComputeContentHash());
     }
 
     [Fact]

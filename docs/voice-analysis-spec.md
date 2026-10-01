@@ -1,4 +1,4 @@
-# voice analysis prototype — technical spec v2.4
+# voice analysis prototype — technical spec v2.5
 
 phase 0 deliverable. the goal is not a game. the goal is to answer "is the tracking good enough to build on?" with numbers, before any engine work happens.
 
@@ -430,6 +430,7 @@ the game abstains based on confidence. frames it can't trust aren't scored, and 
   - `VoicingConfidence` = 0.5 + 0.5 × the margin to the threshold that would change the evidence, normalized to that band and clamped to 0..1. it's 0.5 during a hold.
 - **calibration.** fit a monotone map from raw score to probability on the **dev split** (isotonic regression or binned), then check it on held-out (§6). the calibration table is part of `AnalysisConfig`, so the config hash covers it. recalibrating bumps `AnalyzerVersion`, so the game's PB provenance rule (game doc appendix A) archives old PBs instead of comparing across calibrations.
 - **before step 5** there's no corpus to calibrate against. the raw score is published, and the config records `ConfidenceCalibration = none` so nothing downstream mistakes it for a probability.
+- **as built (v2.5, build step 5).** `AnalysisConfig.Calibration` holds one monotone piecewise-linear map for `F0Confidence` and one per published voicing state. They're fit by binned isotonic regression: pre-bins of ≥ 50 frames that never split tied scores, pooled adjacent violators, then a Laplace-smoothed rate per block so no knot claims exactly 0 or 1. The table is generated source (`VoiceCore/FittedCalibration.cs`), so a refit is a reviewable diff. A state with no reference that can judge it keeps its raw score: today that's **Creak**, since a binary voiced/unvoiced reference can't say whether a Creak frame was right. `ConfidenceCalibrationTable.IsCalibrated(state)` tells the game, which should treat an uncalibrated confidence as below any floor. Fitting is dev only; held-out is scored untouched.
 
 **resonance validity and confidence (v2.3, Astra review).** resonance gets its own rules, independent of `F0Confidence`:
 
@@ -565,11 +566,21 @@ Praat agreement can just mean two systems share the same assumptions, especially
 
 **aspirational targets** (clean-slice): GPE < 2%, FPE < 15 cents, VDE < 5%, F1/F2 error < 60 Hz. but:
 
+- **a target only gates against a reference that can resolve it** (v2.5). the first multi-speaker reference, PTDB-TUG's laryngograph RAPT track, scores Praat itself at FPE 25 cents RMS (median 8), so FPE < 15 is reported but not gated until a finer reference exists (synthetic truth still gates fine error in §3.4). docs/corpus.md records the measurement.
+
 - **gates activate per slice only when the slice has ≥ 3 speakers and ≥ 10 files.** below that, metrics are reported with bootstrap 95% CIs and do not gate CI — worst-slice gating on a 2-file slice is a coin flip.
 - the corpus is split **dev / held-out** (by speaker, not by file). thresholds are tuned on dev; the held-out set is scored untouched and reported alongside.
 - until slices reach minimum size, CI gates are **regression gates**: no metric may worsen by more than its CI vs the last accepted run.
 
 **compute everything per corpus slice, not just in aggregate.** a global pass rate hides failing entirely on gaming headsets. once slices are big enough, gate CI on the worst qualifying slice. slices cut by device/condition, by task, and (v2.3) by **f0 band**: < 150 Hz, 150–250 Hz, > 250 Hz. the octave-down bias (§3.4) and the LPC degradation (§3.6) both depend on f0, and an aggregate would average them away.
+
+**as built (v2.5):** `VoiceCore.Batch corpus run` implements this section. docs/corpus.md lists the choices the table leaves open:
+
+- GPE is computed over frames voiced in both, with a Voiced frame publishing no f0 on an in-range reference counted as gross.
+- the manifest adds `noise_floor_dbfs` and `reference` columns.
+- the reference file format is defined there.
+- per-band VDE assigns unvoiced frames to the file's median reference f0.
+- the run report adds a median |fine| error and a fine bias.
 
 ### corpus contents
 
@@ -662,6 +673,20 @@ v2.4 (2026-09-29, build step 4 findings — YIN and voicing implemented and gate
 - **timestamp-alignment gate** (§3.4): a mean-error gate of ±1 cent (the real off-center check), a provisional pulse-timing margin for harmonic complexes on glides, and contour corners excluded from the cents gate. the margin reflects this YIN's measured per-frame scatter on pulse-like signals at low f0 (RMS 2.3, max 9.1 cents at 2400 cents/s). it isn't a claim that no method could do better. sines still meet ±5 everywhere. the mean and slope gates catch timing bias either way.
 - **raw confidences defined** (§3.9).
 - **measured cost:** 0.14 ms mean, 0.33 ms p99 per frame on a desktop (AVX2), ~1.5% of one core. the direct sum stands; the FFT fallback isn't needed there. `VoiceCore.Batch bench` repeats the measurement on a Steam Deck.
+
+v2.5 (2026-10-01, build step 5: batch mode, debug corpus, metrics, first confidence calibration):
+
+- **batch mode and metrics** (§6) as specified, with per-file Parquet, a run summary with bootstrap CIs by file, qualifying-slice target gates and regression gates against an accepted run. docs/corpus.md covers the corpus layout and every scoring choice.
+- **first corpus:** 80 PTDB-TUG files (20 speakers, 4 sentences each, studio headset read speech) with laryngograph references. 14 speakers are dev and 6 held-out, so the held-out split is speaker-independent from the start. its frame timing isn't documented by the corpus. the offset (22 ms) was measured against Praat, not VoiceCore.
+- **results, analyzer 0.3.0, causal output** (dev / held-out):
+  - GPE 2.7% / 4.1%
+  - VDE 6.3% / 5.7%
+  - FPE 25 / 26 cents (median 8)
+  - **f0 < 150 Hz is the worst slice:** GPE 4.5% / 7.1%, Voiced recall 76% / 73%. that's octave-down errors and missed low-energy voicing, which is step 6's target.
+  - Praat (offline, path-smoothed) on the same reference: GPE 1.6% / 3.2%, VDE 4.9% / 3.7%, FPE 25 cents.
+- **calibration** (§3.9): raw `F0Confidence` was strongly underconfident (raw 0.2–0.3 was right 97% of the time). on held-out speakers, calibration takes the F0Confidence ECE from 0.31 to 0.01 and coverage at a 0.8 floor from 39% to 68%. Creak stays uncalibrated until hand labels exist. analyzer version 0.2.0 → 0.3.0.
+- **FPE target not gated** against a reference that can't resolve it (§6).
+- not yet: the developer's own recordings and Praat references for them (tooling ready), 44.1 kHz resampling, the centered-offline column (§3.5), the breathy coverage gate.
 
 v2.3 fixes from the Astra review (numerically checked with small probes; no implementation existed yet):
 
