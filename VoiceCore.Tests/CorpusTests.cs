@@ -286,6 +286,26 @@ public class ScoringTests
     }
 
     [Fact]
+    public void CreakPrecisionCountsOnlyHandLabeledFrames()
+    {
+        // ChatGPT review: a binary reference's Voiced frame can't judge a published
+        // Creak, so one right labeled Creak + one unjudgeable frame is 100%, not 50%
+        var s = new FrameStats();
+        s.Score(Not(VoicingState.Creak), new RefPoint(RefState.Creak, float.NaN, Binary: false), Min, Max);
+        s.Score(Not(VoicingState.Creak), RefVoiced(200), Min, Max);
+        var precision = Metric.All.Single(m => m.Name == "Creak precision");
+        var recall = Metric.All.Single(m => m.Name == "Creak recall");
+        Assert.Equal(100, precision.Compute(s));
+        Assert.Equal(100, recall.Compute(s));
+
+        // no hand labels at all: undefined (not reported), not 0%
+        var binaryOnly = new FrameStats();
+        binaryOnly.Score(Not(VoicingState.Creak), RefVoiced(200), Min, Max);
+        Assert.True(double.IsNaN(precision.Compute(binaryOnly)));
+        Assert.True(double.IsNaN(recall.Compute(binaryOnly)));
+    }
+
+    [Fact]
     public void F0ConfidenceIsJudgedOnlyWhereBothSidesHaveAPitch()
     {
         Assert.True(FrameStats.F0Right(Voiced(200), RefVoiced(210), Min, Max));
@@ -383,6 +403,21 @@ public class ReportTests
         Assert.Empty(new CorpusReport(files, near).Failures);
         var far = new Dictionary<(string, string, string), (double, double, double)> { [("heldout", "all", "GPE")] = (gpe.Value - 2.5, 0, 0) };
         Assert.Contains(new CorpusReport(files, far).Failures, f => f.Contains("worsened"));
+    }
+
+    [Fact]
+    public void OneFileSlicesFailOnAnyWorsening()
+    {
+        // ChatGPT review: a one-file slice has no CI, and the gate used to skip it
+        // entirely (a siren slice could go from 0% to 100% GPE unnoticed)
+        var worse = new List<FileResult> { File("s0", "dev", gross: 100) };
+        var baseline = new Dictionary<(string, string, string), (double, double, double)> { [("dev", "all", "GPE")] = (0, double.NaN, double.NaN) };
+        var report = new CorpusReport(worse, baseline);
+        Assert.Contains(report.Failures, f => f.Contains("GPE") && f.Contains("worsened"));
+        Assert.Contains("no CI", report.Rows.Single(r => r.Metric == "GPE" && r.Slice == "all").Status);
+
+        var same = new List<FileResult> { File("s0", "dev", gross: 0) };
+        Assert.Empty(new CorpusReport(same, baseline).Failures);
     }
 
     [Fact]
@@ -495,6 +530,37 @@ public class CorpusEndToEndTests : IDisposable
         var runner = new CorpusRunner(corpus, AnalysisConfig.Default);
         Assert.All(corpus.Entries, e => Assert.Null(runner.Run(e)));
         Assert.Equal(2, runner.Warnings.Count);
+    }
+
+    [Fact]
+    public void TheCorpusFingerprintCoversAudioReferencesAndLabels()
+    {
+        // ChatGPT review: the hash covered only manifest and splits, so correcting a
+        // reference or adding hand labels looked like the same corpus to the gate
+        Directory.CreateDirectory(Path.Combine(_root, "audio"));
+        Directory.CreateDirectory(Path.Combine(_root, "reference"));
+        Directory.CreateDirectory(Path.Combine(_root, "labels"));
+        string audio = Path.Combine(_root, "audio", "a.wav");
+        string reference = Path.Combine(_root, "reference", "a.csv");
+        WavWriter.WriteFloat32(audio, new float[4800]);
+        File.WriteAllText(reference, "time_s,state,f0_hz\n0.01,Voiced,200\n");
+        CorpusManifest.Append(_root, new ManifestEntry { SpeakerId = "x", File = "audio/a.wav", Reference = "reference/a.csv" });
+
+        string original = CorpusManifest.Load(_root).ManifestHash;
+        Assert.Equal(original, CorpusManifest.Load(_root).ManifestHash);  // stable
+
+        File.WriteAllText(reference, "time_s,state,f0_hz\n0.01,Voiced,100\n");
+        string correctedReference = CorpusManifest.Load(_root).ManifestHash;
+        Assert.NotEqual(original, correctedReference);
+
+        File.WriteAllText(Path.Combine(_root, "labels", "a.csv"), "start_s,end_s,label\n0,1,Exclude\n");
+        string labeled = CorpusManifest.Load(_root).ManifestHash;
+        Assert.NotEqual(correctedReference, labeled);
+
+        var samples = new float[4800];
+        samples[100] = 0.5f;
+        WavWriter.WriteFloat32(audio, samples);
+        Assert.NotEqual(labeled, CorpusManifest.Load(_root).ManifestHash);
     }
 
     [Fact]

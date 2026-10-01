@@ -74,7 +74,7 @@ dotnet run --project VoiceCore.Batch -c Release -- corpus calibrate
 ```
 
 - **run**: every manifest file goes through the same streaming analyzer as live capture (causal output only) and is scored against its reference. Writes `runs/<time>/report.md` (read this), `summary.csv` (every metric × slice × split with bootstrap 95% CIs) and `frames/<stem>.parquet` (the §4 frame schema plus `ref_state` and `ref_f0_hz`; analyzer version, config hash and calibration in the file metadata). With `--gate`, it exits 1 on a qualifying-slice target miss or a regression.
-- **accept**: makes a run (default: the latest) the regression baseline. Regression gates only apply to runs on the same corpus (manifest + splits hash). Adding files changes what every slice contains, so after a corpus change the run warns, skips the regression gates, and waits for you to review it and `accept` it.
+- **accept**: makes a run (default: the latest) the regression baseline. Regression gates only apply to runs on the same corpus. The corpus fingerprint covers the manifest, the splits, and every file's audio, reference and hand labels (and whether each exists), so correcting a reference or adding labels counts as a corpus change, not an analyzer change. Adding files changes what every slice contains, so after a corpus change the run warns, skips the regression gates, and waits for you to review it and `accept` it.
 - **calibrate**: fits the §3.9 confidence calibration on the **dev split only** and writes `VoiceCore/FittedCalibration.cs`. Then bump `AnalysisConfig.AnalyzerVersion`, rebuild, `corpus run` to score it on held-out, and commit the generated file. The fitted knots are aggregate statistics (no audio or per-frame measurements), and the file names the corpus it was fit on.
 
 ## How each metric is computed
@@ -85,21 +85,22 @@ The spec §6 definitions, with these choices made explicit:
 - **FPE**: RMS cents over the both-voiced, non-gross frames. Also reported: the **median |fine|** (1-cent resolution) and the **fine bias** (|mean signed error|; a timing or tuning offset shows up here).
 - **VDE**: frames where published Voiced ≠ reference Voiced. Creak counts as not voiced on both sides.
 - **Confusion matrix**: published state × reference state, with a fifth column for a binary reference's "not voiced".
-- **Voiced / Creak precision and recall**: from the confusion matrix. Creak precision only counts hand-labeled frames, so it's n/a until step 6.
+- **Voiced / Creak precision and recall**: Voiced comes from the confusion matrix. Creak comes from a separate four-state matrix of hand-labeled frames only, because a binary reference's Voiced column can't say whether a Creak frame was right. With no labels, Creak precision and recall are undefined (n/a), not 0.
 - **Confidence calibration**: ten equal-width bins, with predicted mean vs observed rate and ECE. `F0Confidence` is right when the frame isn't a gross error, judged only where both sides have an in-range pitch. A Voiced frame on an unvoiced reference is a voicing error, judged by `VoicingConfidence`. `VoicingConfidence` is right when the published state matches the reference, per published state. A binary reference can't judge Creak.
 - **Coverage at floor**: reference-voiced in-range frames published Voiced with both confidences ≥ 0.5 / 0.8 / 0.9.
 - **Out-of-range folds**: reference f0 outside 60–1000 Hz, published with an in-range F0Hz.
 - **Slices**: all, source, condition, task, and f0 band (< 150, 150–250, > 250 Hz). For the band slices, voiced frames go by their reference f0, and other frames go by the file's median reference f0, so VDE has a band too. Each slice is reported separately for dev and held-out.
 - **CIs**: bootstrap by **file** (1000 resamples, fixed seed), since frames within a file are correlated.
-- **Gates**: a slice qualifies at ≥ 3 speakers and ≥ 10 files. Qualifying slices are held to GPE < 2% and VDE < 5%. Every metric is held to the regression rule: it may not worsen by more than its CI half-width vs the accepted run.
+- **Gates**: a slice qualifies at ≥ 3 speakers and ≥ 10 files. Qualifying slices are held to GPE < 2% and VDE < 5%. Every metric is held to the regression rule: it may not worsen by more than its CI half-width vs the accepted run. A one-file slice has no CI, and the analyzer is deterministic on a fixed corpus, so on those slices any worsening fails. (Bootstrapping a single file's correlated frames would invent a CI.)
 
 ## Praat references: what to expect
 
-On the developer's first recordings, Praat's own errors showed up immediately:
-- an octave drop in the middle of a siren (175 → 90 Hz, while VoiceCore stayed continuous)
-- breath and background noise called "voiced" at around 650 Hz
+The developer's first recordings showed where a Praat reference is weak:
 
-These count against VoiceCore in GPE and VDE. Read per-file and per-task numbers on Praat-referenced files with that in mind. Step 6's hand labels (with `Exclude`) are the fix.
+- **Siren, 1.84–2.25 s and 15.60–15.81 s (64 frames):** Praat follows the lower octave (~90 Hz) while VoiceCore stays on the continuous upper contour (~180 Hz). The waveform has alternating cycle shapes and real subharmonic structure, and the autocorrelation peaks at f0 and f0/2 are nearly tied. So this is **ambiguous, not a proven Praat error**. It needs adjudication under the annotation guide (step 6), and stays a challenge case either way.
+- **Breath and background noise** get isolated "voiced" islands at around 500–700 Hz, where VoiceCore says Unvoiced. That's plausible as a Praat error, but each interval still needs a label. A high reference f0 alone doesn't justify excluding it.
+
+Read per-file and per-task numbers on Praat-referenced files with that in mind. Hand labels (with `Exclude` for intervals that can't be resolved) are the fix. A second, more independent reference is worth adding too: Praat's filtered autocorrelation (newer than the pinned Praat 6.1.38) or a learned tracker such as CREPE.
 
 ## Not yet
 

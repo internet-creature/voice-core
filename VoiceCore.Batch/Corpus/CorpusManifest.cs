@@ -54,7 +54,7 @@ internal sealed class CorpusManifest
     public string Root { get; }
     public List<ManifestEntry> Entries { get; }
 
-    /// <summary>SHA-256 of manifest.csv and splits.csv, so a run summary names the corpus it scored.</summary>
+    /// <summary>Fingerprint of everything that's scored (see <see cref="Fingerprint"/>), so a run summary names the corpus it scored.</summary>
     public string ManifestHash { get; }
 
     public string PathOf(string relative) => System.IO.Path.Combine(Root, relative);
@@ -107,11 +107,39 @@ internal sealed class CorpusManifest
             }
         }
 
+        return new CorpusManifest(root, entries, splits, Fingerprint(root, manifestPath, splitsPath, entries));
+    }
+
+    /// <summary>
+    /// Identifies the scoring evidence: manifest and splits, plus every file's audio,
+    /// reference and hand labels, each with its presence. Correcting a reference or
+    /// adding labels changes it, so annotation work can't pass for an analyzer change
+    /// in the regression gate. The analyzer is identified separately (config hash).
+    /// </summary>
+    private static string Fingerprint(string root, string manifestPath, string splitsPath, List<ManifestEntry> entries)
+    {
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        sha.AppendData(System.IO.File.ReadAllBytes(manifestPath));
-        if (System.IO.File.Exists(splitsPath))
-            sha.AppendData(System.IO.File.ReadAllBytes(splitsPath));
-        return new CorpusManifest(root, entries, splits, Convert.ToHexStringLower(sha.GetHashAndReset())[..16]);
+        void Add(string label, string path)
+        {
+            sha.AppendData(System.Text.Encoding.UTF8.GetBytes(label + "\0"));
+            if (System.IO.File.Exists(path))
+            {
+                sha.AppendData("present\0"u8);
+                sha.AppendData(System.IO.File.ReadAllBytes(path));
+            }
+            else
+                sha.AppendData("absent\0"u8);
+        }
+        Add("manifest", manifestPath);
+        Add("splits", splitsPath);
+        foreach (var e in entries)
+        {
+            Add("audio:" + e.File, System.IO.Path.Combine(root, e.File));
+            Add("reference:" + e.Reference, e.Reference.Length > 0 ? System.IO.Path.Combine(root, e.Reference) : "");
+            string labels = System.IO.Path.Combine("labels", e.Stem + ".csv");
+            Add("labels:" + labels, System.IO.Path.Combine(root, labels));
+        }
+        return Convert.ToHexStringLower(sha.GetHashAndReset())[..16];
     }
 
     public static void Append(string root, ManifestEntry e)

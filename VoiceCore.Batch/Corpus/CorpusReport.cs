@@ -18,6 +18,9 @@ internal sealed class CorpusReport
     public const int MinSpeakers = 3;
     public const int MinFiles = 10;
     public const int BootstrapResamples = 1000;
+
+    /// <summary>Below this, a change is float noise, not a regression.</summary>
+    public const double RoundingTolerance = 1e-9;
     public static readonly string[] Splits = ["dev", "heldout"];
 
     private readonly List<FileResult> _results;
@@ -101,14 +104,17 @@ internal sealed class CorpusReport
                     Failures.Add($"{split} / {slice}: {metric.Name} {Format(value)} {metric.Unit} misses the target {target} {metric.Unit}.");
                 }
             }
-            if (accepted is not null && accepted.TryGetValue((split, slice, metric.Name), out var before) && !double.IsNaN(lo))
+            if (accepted is not null && accepted.TryGetValue((split, slice, metric.Name), out var before) && !double.IsNaN(before.Value))
             {
-                // no metric may worsen by more than its CI vs the last accepted run (spec §6)
-                double tolerance = (hi - lo) / 2;
+                // no metric may worsen by more than its CI vs the last accepted run (spec §6).
+                // A one-file slice has no CI (bootstrapping its correlated frames would
+                // invent one), and the analyzer is deterministic on a fixed corpus, so
+                // there any worsening at all fails.
+                double tolerance = double.IsNaN(lo) ? RoundingTolerance : Math.Max((hi - lo) / 2, RoundingTolerance);
                 double worse = metric.LowerIsBetter ? value - before.Value : before.Value - value;
                 if (worse > tolerance)
                 {
-                    status.Add($"REGRESSED from {Format(before.Value)}");
+                    status.Add($"REGRESSED from {Format(before.Value)}{(double.IsNaN(lo) ? " (one file, no CI: any worsening fails)" : "")}");
                     Failures.Add($"{split} / {slice}: {metric.Name} worsened from {Format(before.Value)} to {Format(value)} {metric.Unit} (more than its CI half-width {Format(tolerance)}).");
                 }
                 else
@@ -170,6 +176,7 @@ internal sealed class CorpusReport
             sb.AppendLine($"- {f}");
         sb.AppendLine();
         sb.AppendLine($"Targets (spec §6, aspirational): GPE < 2%, VDE < 5%. They gate only slices with ≥ {MinSpeakers} speakers and ≥ {MinFiles} files; smaller slices report bootstrap 95% CIs and are held to regression gates against the last accepted run. "
+            + "One-file slices have no CI, so any worsening fails their regression gate. "
             + "FPE < 15 cents is reported, not gated: the laryngograph reference scores Praat itself at ~25 cents RMS (docs/corpus.md).");
         sb.AppendLine();
 

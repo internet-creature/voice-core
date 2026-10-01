@@ -63,6 +63,13 @@ internal sealed class FrameStats
     public long VoicingMismatch;   // VDE numerator: voiced vs not disagrees
     public readonly long[,] Confusion = new long[4, 5];  // [published state, reference column]
 
+    /// <summary>
+    /// Only frames with a four-state (hand-labeled) reference, [published, reference].
+    /// Creak precision and recall come from here: a binary reference's Voiced column
+    /// can't say whether a published Creak was right.
+    /// </summary>
+    public readonly long[,] FourStateConfusion = new long[4, 4];
+
     public long BothVoiced;        // GPE denominator: reference voiced in range, published Voiced
     public long Gross;
     public long FineN;
@@ -89,6 +96,9 @@ internal sealed class FrameStats
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 5; j++)
                 Confusion[i, j] += o.Confusion[i, j];
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                FourStateConfusion[i, j] += o.FourStateConfusion[i, j];
         BothVoiced += o.BothVoiced;
         Gross += o.Gross;
         FineN += o.FineN;
@@ -165,6 +175,8 @@ internal sealed class FrameStats
             VoicingMismatch++;
         int column = r.Binary && r.State == RefState.Unvoiced ? NotVoicedColumn : (int)r.State;
         Confusion[(int)f.Voicing, column]++;
+        if (!r.Binary)
+            FourStateConfusion[(int)f.Voicing, (int)r.State]++;
 
         if (StateRight(f, r) is { } right && !float.IsNaN(f.VoicingConfidence))
             VoicingReliability[(int)f.Voicing].Add(f.VoicingConfidence, right);
@@ -243,19 +255,20 @@ internal sealed record Metric(string Name, string Unit, bool LowerIsBetter, Func
 
     private static double CreakPrecision(FrameStats s)
     {
-        // only four-state (hand-labeled) reference columns can say a Creak frame was right
+        // only four-state (hand-labeled) frames can say whether a Creak frame was right;
+        // with none, precision is undefined (NaN), not 0
         long judged = 0;
         for (int j = 0; j < 4; j++)
-            judged += s.Confusion[(int)VoicingState.Creak, j];
-        return Ratio(s.Confusion[(int)VoicingState.Creak, (int)RefState.Creak], judged);
+            judged += s.FourStateConfusion[(int)VoicingState.Creak, j];
+        return Ratio(s.FourStateConfusion[(int)VoicingState.Creak, (int)RefState.Creak], judged);
     }
 
     private static double CreakRecall(FrameStats s)
     {
         long reference = 0;
         for (int i = 0; i < 4; i++)
-            reference += s.Confusion[i, (int)RefState.Creak];
-        return Ratio(s.Confusion[(int)VoicingState.Creak, (int)RefState.Creak], reference);
+            reference += s.FourStateConfusion[i, (int)RefState.Creak];
+        return Ratio(s.FourStateConfusion[(int)VoicingState.Creak, (int)RefState.Creak], reference);
     }
 
     public static readonly Metric Gpe = new("GPE", "%", true, s => 100 * Ratio(s.Gross, s.BothVoiced));
