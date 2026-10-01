@@ -104,8 +104,11 @@ internal static class CorpusCommands
         float? floor = float.TryParse(sidecar.GetValueOrDefault("noise_floor_dbfs", ""), CultureInfo.InvariantCulture, out float f) ? f : null;
         string flags = sidecar.GetValueOrDefault("raw", "") switch
         {
-            "True" => "off (raw capture)",
-            "False" => "unknown (raw capture not granted)",
+            // RawCaptureStatus as the probe writes it
+            "Requested" => "raw requested (WASAPI; applied only if the device supports it)",
+            "RejectedFellBack" => "unknown (raw request rejected)",
+            "NotRequested" => "unknown (raw not requested)",
+            "Unavailable" => "unknown (no raw option on this path)",
             _ => "unknown",
         };
 
@@ -186,11 +189,22 @@ internal static class CorpusCommands
             return 1;
         }
 
+        File.WriteAllText(Path.Combine(runDir, "corpus-hash.txt"), corpus.ManifestHash);
+
+        // regressions only mean something on the same corpus: adding files changes
+        // what every slice contains, so a different corpus skips the gate (re-accept)
         string acceptedPath = Path.Combine(root, "accepted", "summary.csv");
-        var accepted = File.Exists(acceptedPath) ? CorpusReport.ReadSummaryCsv(acceptedPath) : null;
+        string acceptedHashPath = Path.Combine(root, "accepted", "corpus-hash.txt");
+        string? acceptedHash = File.Exists(acceptedHashPath) ? File.ReadAllText(acceptedHashPath).Trim() : null;
+        bool sameCorpus = acceptedHash == corpus.ManifestHash;
+        var accepted = File.Exists(acceptedPath) && sameCorpus ? CorpusReport.ReadSummaryCsv(acceptedPath) : null;
+        if (File.Exists(acceptedPath) && !sameCorpus)
+            warnings.Add($"the regression baseline was scored on corpus {acceptedHash ?? "unknown"}, this is {corpus.ManifestHash}: "
+                + "regression gates skipped. Review this run, then `corpus accept` it.");
         var report = new CorpusReport(results, accepted);
         report.WriteSummaryCsv(Path.Combine(runDir, "summary.csv"));
-        string acceptedNote = accepted is null ? "none yet (`corpus accept` sets one)"
+        string acceptedNote = !File.Exists(acceptedPath) ? "none yet (`corpus accept` sets one)"
+            : !sameCorpus ? "skipped: the accepted run was on a different corpus"
             : File.ReadAllText(Path.Combine(root, "accepted", "run.txt")).Trim();
         File.WriteAllText(Path.Combine(runDir, "report.md"), report.Markdown(Header(runId, corpus, config, results, acceptedNote), warnings));
 
@@ -246,6 +260,11 @@ internal static class CorpusCommands
         string accepted = Path.Combine(root, "accepted");
         Directory.CreateDirectory(accepted);
         File.Copy(summary, Path.Combine(accepted, "summary.csv"), overwrite: true);
+        string hash = Path.Combine(runs, runId, "corpus-hash.txt");
+        if (File.Exists(hash))
+            File.Copy(hash, Path.Combine(accepted, "corpus-hash.txt"), overwrite: true);
+        else
+            File.Delete(Path.Combine(accepted, "corpus-hash.txt"));  // a run from before hashes were recorded never matches
         File.WriteAllText(Path.Combine(accepted, "run.txt"), $"run {runId}, accepted {DateTime.Now:yyyy-MM-dd HH:mm}");
         Console.WriteLine($"run {runId} is now the regression baseline.");
         return 0;

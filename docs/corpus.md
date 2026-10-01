@@ -74,7 +74,7 @@ dotnet run --project VoiceCore.Batch -c Release -- corpus calibrate
 ```
 
 - **run**: every manifest file goes through the same streaming analyzer as live capture (causal output only) and is scored against its reference. Writes `runs/<time>/report.md` (read this), `summary.csv` (every metric × slice × split with bootstrap 95% CIs) and `frames/<stem>.parquet` (the §4 frame schema plus `ref_state` and `ref_f0_hz`; analyzer version, config hash and calibration in the file metadata). With `--gate`, it exits 1 on a qualifying-slice target miss or a regression.
-- **accept**: makes a run (default: the latest) the regression baseline.
+- **accept**: makes a run (default: the latest) the regression baseline. Regression gates only apply to runs on the same corpus (manifest + splits hash). Adding files changes what every slice contains, so after a corpus change the run warns, skips the regression gates, and waits for you to review it and `accept` it.
 - **calibrate**: fits the §3.9 confidence calibration on the **dev split only** and writes `VoiceCore/FittedCalibration.cs`. Then bump `AnalysisConfig.AnalyzerVersion`, rebuild, `corpus run` to score it on held-out, and commit the generated file. The fitted knots are aggregate statistics (no audio or per-frame measurements), and the file names the corpus it was fit on.
 
 ## How each metric is computed
@@ -92,6 +92,14 @@ The spec §6 definitions, with these choices made explicit:
 - **Slices**: all, source, condition, task, and f0 band (< 150, 150–250, > 250 Hz). For the band slices, voiced frames go by their reference f0, and other frames go by the file's median reference f0, so VDE has a band too. Each slice is reported separately for dev and held-out.
 - **CIs**: bootstrap by **file** (1000 resamples, fixed seed), since frames within a file are correlated.
 - **Gates**: a slice qualifies at ≥ 3 speakers and ≥ 10 files. Qualifying slices are held to GPE < 2% and VDE < 5%. Every metric is held to the regression rule: it may not worsen by more than its CI half-width vs the accepted run.
+
+## Praat references: what to expect
+
+On the developer's first recordings, Praat's own errors showed up immediately:
+- an octave drop in the middle of a siren (175 → 90 Hz, while VoiceCore stayed continuous)
+- breath and background noise called "voiced" at around 650 Hz
+
+These count against VoiceCore in GPE and VDE. Read per-file and per-task numbers on Praat-referenced files with that in mind. Step 6's hand labels (with `Exclude`) are the fix.
 
 ## Not yet
 
