@@ -45,6 +45,8 @@ internal sealed class CorpusReport
             yield return ($"source={s}", r => r.Entry.Source == s ? r.Total : null);
         foreach (string c in _results.Select(r => r.Entry.Condition).Distinct().Order())
             yield return ($"condition={c}", r => r.Entry.Condition == c ? r.Total : null);
+        foreach (string d in _results.Select(r => r.Entry.Device).Distinct().Order())
+            yield return ($"device={d}", r => r.Entry.Device == d ? r.Total : null);
         foreach (string t in _results.Select(r => r.Entry.Task).Distinct().Order())
             yield return ($"task={t}", r => r.Entry.Task == t ? r.Total : null);
         foreach (string band in CorpusRunner.Bands)

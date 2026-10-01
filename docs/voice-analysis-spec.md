@@ -176,6 +176,7 @@ v1's latency table mixed these. the budget in §5 uses the definitions above.
 - **RMS** over the hop → dBFS
 - **peak** over the hop → dBFS, plus a clipping flag at > −0.1 dBFS
 - **noise floor**: measured during an explicit calibration step (2 s of instructed silence → 10th percentile of hop RMS), persisted. during use, adapt slowly (time constant ~10 s) but **only during frames already classified Silence** — never let speech drag the floor up. v1 said both "rolling 5 s" and "captured during calibration"; this replaces both.
+- **device-side processing shows up in calibration** (v2.5, found on a webcam mic). The Insta360 Link 2C Pro delivered *exact digital zero* during instructed silence, even with WASAPI raw mode requested. That means the device runs its own noise suppression or gate; it probably also applies gain control, since it was ~15 dB louder than a condenser at a greater distance. The calibrated floor then clamps to −100 dBFS and the level gate stops gating. Calibration must detect this (a silence window that's all zeros, or a floor at the clamp) and report "this mic processes its audio" to the player, and the session log must record it. What the gate should do instead is open: candidates are the 10th percentile of non-zero hops, or a fixed floor for such devices. It needs corpus evidence from more processed mics, and it's tracked as a step 6+ item.
 
 ### 3.3 voicing decision — explicit order (rewritten in v2)
 
