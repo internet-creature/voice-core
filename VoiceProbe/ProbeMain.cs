@@ -59,10 +59,9 @@ public partial class ProbeMain : Control
 
     private OptionButton _pathPicker = null!, _devicePicker = null!, _outputPicker = null!, _rangePicker = null!;
     private CheckBox _rawToggle = null!, _cameraToggle = null!;
-    private CheckButton _recordToggle = null!;
-    private Button _startButton = null!, _loopbackButton = null!, _calibrateButton = null!, _deleteButton = null!;
+    private Button _startButton = null!, _recordButton = null!, _loopbackButton = null!, _calibrateButton = null!, _deleteButton = null!;
     private Label _status = null!, _diagnostics = null!, _loopbackResult = null!, _cameraHint = null!;
-    private Label _pitchReadout = null!, _floorLabel = null!, _recIndicator = null!;
+    private Label _pitchReadout = null!, _floorLabel = null!;
     private LevelMeter _meter = null!;
     private LevelTrace _trace = null!;
     private PitchTrace _pitch = null!;
@@ -106,7 +105,7 @@ public partial class ProbeMain : Control
                 _printDiagnosticsOnStop = true;
                 StartCapture();
                 if (args.ContainsKey("record"))
-                    _recordToggle.ButtonPressed = true;
+                    StartRecording();
             }
             if (args.TryGetValue("screenshot", out var shot))
                 ScheduleScreenshot(shot);
@@ -137,7 +136,7 @@ public partial class ProbeMain : Control
         }
 
         if (_recorder is not null)
-            _recIndicator.Text = $"● REC {_recorder.Duration:mm\\:ss}";
+            _recordButton.Text = $"■ Stop recording   {_recorder.Duration:mm\\:ss}";
 
         _flashRemaining -= delta;
         _flash.Visible = _flashRemaining > 0;
@@ -202,7 +201,7 @@ public partial class ProbeMain : Control
             }
             _startButton.Text = "Stop";
             _calibrateButton.Disabled = false;
-            _recordToggle.Disabled = false;
+            GetWindow().Title = $"VoiceProbe — {FileSafe(_deviceLabel)}";  // tells two side-by-side windows apart
             _trace.Clear();
             _pitch.Clear();
         }
@@ -235,8 +234,7 @@ public partial class ProbeMain : Control
             return;
         _startButton.Text = "Start";
         _calibrateButton.Disabled = true;
-        _recordToggle.Disabled = true;
-        _recordToggle.SetPressedNoSignal(false);  // opt-in per session (§0): never carries over
+        GetWindow().Title = "VoiceProbe";
     }
 
     private void DrainFrames()
@@ -264,11 +262,12 @@ public partial class ProbeMain : Control
         }
     }
 
-    private static string Readout(in AnalysisFrame f) => f.Voicing switch
+    private string Readout(in AnalysisFrame f) => f.Voicing switch
     {
         VoicingState.Voiced when f.F0Range == F0Range.Above => "above the tracker's range",
         VoicingState.Voiced when float.IsFinite(f.F0Hz) =>
-            $"{f.F0Hz,6:0.0} Hz   {NoteNames.Of(f.F0Hz)}   confidence {f.F0Confidence:0.00} (raw, uncalibrated)",
+            $"{f.F0Hz,6:0.0} Hz   {NoteNames.Of(f.F0Hz)}   confidence {f.F0Confidence:0.00}"
+            + (_config.Calibration is null ? " (raw, uncalibrated)" : ""),
         VoicingState.Voiced => "voiced, no pitch",
         VoicingState.Creak => "creak",
         VoicingState.Unvoiced => "unvoiced",
@@ -321,12 +320,26 @@ public partial class ProbeMain : Control
 
     // --- opt-in recording (§0: opt-in per session, visibly indicated, deletable) ---
 
-    private void SetRecording(bool on)
+    /// <summary>
+    /// The Record button: one click opens the mic if it isn't open and starts
+    /// recording, the next stops recording and leaves the mic running. Never on
+    /// unless clicked in this session (§0).
+    /// </summary>
+    private void ToggleRecording()
     {
-        if (on)
-            StartRecording();
-        else
+        if (_recorder is not null)
+        {
             StopRecording();
+            return;
+        }
+        if (_pipeline is null)
+            StartCapture();
+        if (_pipeline is null)
+            return;  // capture failed; the status line says why
+        StartRecording();
+        if (_floorSource != "calibrated")
+            _status.Text += "\nTip: press Calibrate noise floor while silent to measure this session's floor "
+                + $"(now using: {_floorSource}).";
     }
 
     private void StartRecording()
@@ -335,7 +348,9 @@ public partial class ProbeMain : Control
             return;
         string dir = ProjectSettings.GlobalizePath(RecordingsDir);
         Directory.CreateDirectory(dir);
-        string name = $"rec-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}";
+        // the device in the name keeps two probe windows recording two mics at once
+        // (spec §6: one performance, several devices) from colliding
+        string name = $"rec-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}-{FileSafe(_deviceLabel)}";
         string wav = Path.Combine(dir, name + ".wav");
         _recorder = new RingRecorder(_pipeline.Audio, wav);
         File.WriteAllLines(Path.Combine(dir, name + ".txt"),
@@ -349,8 +364,22 @@ public partial class ProbeMain : Control
             $"analyzer_config_hash: {_config.ComputeContentHash()}",
             $"started: {DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture)}",
         ]);
-        _recIndicator.Visible = true;
+        UpdateRecordButton();
+        _status.Text = $"Recording to {name}.wav";
         _log?.Write("recording.started", wav);
+    }
+
+    /// <summary>"Microphone (AT2020USB-X) [Windows WASAPI]" → "AT2020USB-X": short and filename-safe.</summary>
+    private static string FileSafe(string deviceLabel)
+    {
+        string name = deviceLabel;
+        int open = name.IndexOf('('), close = name.IndexOf(')');
+        if (open >= 0 && close > open + 1)
+            name = name[(open + 1)..close];  // Windows puts the product name in parentheses
+        else if (name.IndexOf('[') is > 0 and var bracket)
+            name = name[..bracket];
+        var safe = new string(name.Trim().Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '-').ToArray()).Trim('-');
+        return safe.Length == 0 ? "mic" : safe.Length > 32 ? safe[..32] : safe;
     }
 
     private void StopRecording()
@@ -367,14 +396,21 @@ public partial class ProbeMain : Control
         _log?.Write("recording.stopped", $"{_recorder.Path} ({_recorder.Duration.TotalSeconds:0.0} s)");
         _status.Text = $"Saved recording: {_recorder.Path}";
         _recorder = null;
-        if (_recIndicator is not null)
-            _recIndicator.Visible = false;
+        UpdateRecordButton();
+    }
+
+    private void UpdateRecordButton()
+    {
+        if (_recordButton is null)
+            return;
+        bool on = _recorder is not null;
+        _recordButton.Text = on ? "■ Stop recording   00:00" : "● Record";
+        _recordButton.Modulate = on ? new Color(1f, 0.35f, 0.35f) : Colors.White;
     }
 
     private void DeleteAllRecordings()
     {
         StopRecording();
-        _recordToggle.SetPressedNoSignal(false);
         string dir = ProjectSettings.GlobalizePath(RecordingsDir);
         int deleted = 0;
         if (Directory.Exists(dir))
@@ -606,6 +642,15 @@ public partial class ProbeMain : Control
         _startButton = new Button { Text = "Start", CustomMinimumSize = new Vector2(90, 0) };
         _startButton.Pressed += () => { if (_pipeline is null) StartCapture(); else StopCapture(); };
         captureRow.AddChild(_startButton);
+        _recordButton = new Button
+        {
+            Text = "● Record",
+            CustomMinimumSize = new Vector2(210, 0),
+            TooltipText = "Starts the mic if needed and records it to disk. Click again to stop. Shortcut: R",
+            Shortcut = new Shortcut { Events = [new InputEventKey { Keycode = Key.R }] },
+        };
+        _recordButton.Pressed += ToggleRecording;
+        captureRow.AddChild(_recordButton);
 
         _status = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, Text = "Pick a device and press Start.", Modulate = new Color(1, 1, 1, 0.75f) };
         column.AddChild(_status);
@@ -640,12 +685,6 @@ public partial class ProbeMain : Control
         toolsRow.AddChild(_calibrateButton);
         _floorLabel = new Label { Text = "", SizeFlagsHorizontal = SizeFlags.ExpandFill };
         toolsRow.AddChild(_floorLabel);
-        _recIndicator = new Label { Text = "● REC", Visible = false, Modulate = new Color(1f, 0.25f, 0.25f) };
-        _recIndicator.AddThemeFontSizeOverride("font_size", 18);
-        toolsRow.AddChild(_recIndicator);
-        _recordToggle = new CheckButton { Text = "Record audio (saved to disk)", Disabled = true };
-        _recordToggle.Toggled += SetRecording;
-        toolsRow.AddChild(_recordToggle);
         var openButton = new Button { Text = "Open recordings" };
         openButton.Pressed += () =>
         {

@@ -206,7 +206,9 @@ public sealed class VoiceAnalyzer
             PeakDbfs = AmplitudeToDbfs(peak),
             Clipping = peak > _clippingLinear,
             Voicing = decision.State,
-            VoicingConfidence = decision.Confidence,
+            VoicingConfidence = Config.Calibration?.VoicingFor(decision.State) is { } voicingMap
+                ? voicingMap.Apply(decision.Confidence)
+                : decision.Confidence,
         };
 
         if (candidate is { } c)
@@ -220,7 +222,7 @@ public sealed class VoiceAnalyzer
                     F0Range = c.Range,
                     F0Hz = inRange ? c.F0Hz : float.NaN,
                     F0Cents = inRange ? 1200f * MathF.Log2(c.F0Hz / 55f) : float.NaN,
-                    F0Confidence = inRange ? F0Confidence(c, decision, rmsDbfs - gate) : float.NaN,
+                    F0Confidence = inRange ? Calibrated(F0Confidence(c, decision, rmsDbfs - gate)) : float.NaN,
                 };
             }
         }
@@ -229,8 +231,11 @@ public sealed class VoiceAnalyzer
         return frame;
     }
 
+    private float Calibrated(float rawF0Confidence) =>
+        Config.Calibration is { } table ? table.F0.Apply(rawF0Confidence) : rawF0Confidence;
+
     /// <summary>
-    /// Raw f0 confidence (§3.9, uncalibrated until build step 5): periodicity
+    /// Raw f0 confidence (§3.9; the config's calibration maps it to a probability): periodicity
     /// (1 − d′, scaled over the voiced range), times factors for candidate stability,
     /// level above the gate, whether a real dip was found, and hysteresis holds.
     /// Monotone in each input, which is all a calibration map needs.

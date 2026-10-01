@@ -483,3 +483,7 @@ $RECYCLE.BIN/
 
 # Python tooling (tools/praat_compare.py)
 tools/.venv/
+
+# debug corpus (spec §6): recordings, references, consent records and runs stay local.
+# The repo is public; never commit voice audio or measurements derived from it.
+/corpus/
