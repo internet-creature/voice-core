@@ -115,6 +115,27 @@ public sealed class SyntheticSignal
         return start >= p.Start + p.Ramp && end <= p.Start + p.Length - p.Ramp;
     }
 
+    /// <summary>
+    /// True if f0 is a single straight line in cents across <c>[start, end)</c>: one
+    /// voiced segment, no contour breakpoint strictly inside. At a breakpoint the
+    /// "true f0 at the center" is not what any windowed estimator measures.
+    /// </summary>
+    public bool IsF0Linear(long start, long end)
+    {
+        if (start < 0 || end > Length)
+            return false;
+        var p = Find(start);
+        if (p.Segment is not VoicedSegment v || end > p.Start + p.Length)
+            return false;
+        foreach (double t in v.Contour.BreakpointSeconds)
+        {
+            double at = p.Start + t * SampleRate;
+            if (at > start && at < end - 1)
+                return false;
+        }
+        return true;
+    }
+
     /// <summary>Start sample of the segment containing <paramref name="sample"/>.</summary>
     public long SegmentStartAt(long sample) => Find(sample).Start;
 

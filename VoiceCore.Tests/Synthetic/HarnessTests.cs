@@ -157,6 +157,33 @@ public class HarnessTests
     }
 
     [Fact]
+    public void OffCenterVoiceGlideIsCaughtByTheBiasGate()
+    {
+        // harmonic complexes get a per-frame pulse-timing allowance on glides, so the
+        // mean-error gate is what must catch a window measuring 320 samples late
+        var c = Suites.Find("timestamp/voice/up/2400cps");
+        Assert.True(c.Expect.AllowPulseTiming);
+        var signal = c.Build();
+        var late = Oracle(signal, t => Perfect(t) with
+        {
+            F0Hz = (float)signal.F0At(Math.Min(t.Frame.WindowCenterSample + 320, signal.Length - 1)),
+        });
+
+        var result = Harness.Evaluate(late, c.Expect);
+        Assert.False(result.Passed);
+        Assert.Contains(result.Failures, f => f.Contains("systematic bias"));
+        Assert.True(Harness.Evaluate(Oracle(signal, Perfect), c.Expect).Passed);
+    }
+
+    [Fact]
+    public void PulseTimingAllowanceIsZeroForSteadyTones()
+    {
+        var expect = new CaseExpectation { MaxAbsCents = 5, AllowPulseTiming = true };
+        var steady = Harness.Run(Suites.Tone(120, HarmonicProfile.Voice)).First(t => t.Steady);
+        Assert.Equal(5, Harness.Tolerance(5, steady, expect), 9);
+    }
+
+    [Fact]
     public void OnsetFramesInsideTheSettleWindowAreNotScored()
     {
         var c = Suites.Find("breathy/200Hz/hnr5/phase0");
@@ -177,11 +204,14 @@ public class HarnessTests
     }
 
     [Fact]
-    public void TodaysPassthroughAnalyzerFailsTheSmokeGate()
+    public void AnalyzerWithoutPitchWouldFailTheSmokeGate()
     {
-        // end to end through the real VoiceAnalyzer: no pitch yet, so no pass
-        var result = Harness.Evaluate(Harness.Run(Smoke.Build()), Smoke.Expect);
-        Assert.False(result.Passed);
+        // the harness isn't vacuous end to end: real frames with the pitch fields
+        // blanked (as the step 1 analyzer published them) must fail
+        var blanked = Harness.Run(Smoke.Build())
+            .Select(t => t with { Frame = t.Frame with { Voicing = VoicingState.Silence, F0Hz = float.NaN } })
+            .ToArray();
+        Assert.False(Harness.Evaluate(blanked, Smoke.Expect).Passed);
     }
 
     [Fact]

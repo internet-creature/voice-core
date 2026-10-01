@@ -128,10 +128,14 @@ public class VoiceAnalyzerTests
     [Fact]
     public void UnimplementedMeasurementsAreNaN()
     {
+        // pitch and voicing arrive in step 4; the display track (§3.5), formants,
+        // CPP and the brightness proxy are later steps
         var f = TestSignals.Analyze(TestSignals.Busy(5000), () => 5000)[0];
+        Assert.Equal(VoicingState.Voiced, f.Voicing);
+        Assert.False(float.IsNaN(f.F0Hz));
         float[] notYet =
         [
-            f.VoicingConfidence, f.F0RawHz, f.F0Hz, f.F0DisplayHz, f.F0Cents, f.F0Confidence, f.Aperiodicity,
+            f.F0DisplayHz,
             f.F1Hz, f.B1Hz, f.F2Hz, f.B2Hz, f.F3Hz, f.B3Hz, f.F4Hz, f.B4Hz, f.FormantConfidence,
             f.CppDb, f.BrightnessProxy, f.SpectralTiltDbPerKhz,
         ];
@@ -178,4 +182,50 @@ public class VoiceAnalyzerTests
         Assert.Throws<ArgumentException>(() => new VoiceAnalyzer(AnalysisConfig.Default with { DcFilterPole = 1f }));
         Assert.Throws<ArgumentException>(() => new VoiceAnalyzer(AnalysisConfig.Default with { ClippingThresholdDbfs = 1f }));
     }
+
+    public static TheoryData<string, Func<AnalysisConfig, AnalysisConfig>> BadConfigs => new()
+    {
+        // regression (Sol review of 4a): NaN noise floor was accepted and silenced every frame
+        { "noise floor NaN", c => c with { DefaultNoiseFloorDbfs = float.NaN } },
+        { "noise floor +∞", c => c with { DefaultNoiseFloorDbfs = float.PositiveInfinity } },
+        { "noise floor above 0 dBFS", c => c with { DefaultNoiseFloorDbfs = 5 } },
+        { "floor time constant NaN", c => c with { NoiseFloorTimeConstantSeconds = float.NaN } },
+        { "level margin NaN", c => c with { VoicedLevelMarginDb = float.NaN } },
+        { "level margin negative", c => c with { VoicedLevelMarginDb = -1 } },
+        { "voiced aperiodicity NaN", c => c with { VoicedAperiodicityMax = float.NaN } },
+        { "breathy aperiodicity +∞", c => c with { BreathyAperiodicityMax = float.PositiveInfinity } },
+        { "stable cents NaN", c => c with { StableCents = float.NaN } },
+        { "stable cents zero", c => c with { StableCents = 0 } },
+        { "low ZCR NaN", c => c with { LowZcrPerSecond = float.NaN } },
+        { "YIN threshold NaN", c => c with { YinThreshold = float.NaN } },
+        { "f0 floor NaN", c => c with { F0SearchMinHz = float.NaN } },
+        { "f0 ceiling NaN", c => c with { F0SearchMaxHz = float.NaN } },
+        { "f0 ceiling above fs/3", c => c with { F0SearchMaxHz = 20_000 } },
+        { "f0 floor too low for the window", c => c with { F0SearchMinHz = 47 } },
+        { "clipping threshold NaN", c => c with { ClippingThresholdDbfs = float.NaN } },
+    };
+
+    [Theory]
+    [MemberData(nameof(BadConfigs))]
+    public void NonFiniteOrOutOfRangeSettingsAreRejected(string _, Func<AnalysisConfig, AnalysisConfig> bad) =>
+        Assert.Throws<ArgumentException>(() => new VoiceAnalyzer(bad(AnalysisConfig.Default)));
+
+    [Fact]
+    public void NaNCalibratedNoiseFloorIsRejected()
+    {
+        var analyzer = new VoiceAnalyzer(AnalysisConfig.Default);
+        Assert.Throws<ArgumentOutOfRangeException>(() => analyzer.CalibratedNoiseFloorDbfs = float.NaN);
+        Assert.Throws<ArgumentOutOfRangeException>(() => analyzer.CalibratedNoiseFloorDbfs = 3);
+    }
+
+    [Fact]
+    public void LowestValidF0FloorStillWorks()
+    {
+        // 48 Hz → MaxLag 1000, lags to 1024, W = 1024: just outlasts the longest period
+        var config = AnalysisConfig.Default with { F0SearchMinHz = 48 };
+        var frames = TestSignals.Analyze(new VoiceAnalyzer(config), Synthetic_Tone(55), () => 480);
+        Assert.Contains(frames, f => f.Voicing == VoicingState.Voiced && Math.Abs(f.F0Hz - 55) < 0.5);
+    }
+
+    private static float[] Synthetic_Tone(double hz) => VoiceCore.Synthetic.Suites.Tone(hz, VoiceCore.Synthetic.HarmonicProfile.Voice).Samples;
 }

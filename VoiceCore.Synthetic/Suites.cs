@@ -125,8 +125,13 @@ public static class Suites
     /// <summary>
     /// Constant-rate glides 100 ↔ 900 Hz at 600, 1200 and 2400 cents/s, both
     /// directions. F0Hz must match the true f0 at WindowCenterSample within ±5
-    /// cents; <see cref="ErrorSummary.CentsPerPeriodMsSlope"/> exposes any trend
-    /// in error vs period.
+    /// cents per frame, and the mean error must be within ±1 cent (the bias an
+    /// off-center window would cause). For harmonic complexes the per-frame
+    /// tolerance adds the glide's change over half a period (spec §3.4 v2.4): that
+    /// is this estimator's measured scatter on pulse-like signals, and it's a
+    /// provisional allowance.
+    /// <see cref="ErrorSummary.CentsPerPeriodMsSlope"/> exposes any trend in error
+    /// vs period.
     /// </summary>
     public static IEnumerable<SuiteCase> TimestampAlignment()
     {
@@ -138,7 +143,7 @@ public static class Suites
             yield return new SuiteCase(
                 Invariant($"timestamp/{waveName}/{(rising ? "up" : "down")}/{rate}cps"),
                 () => GlideSignal(from, to, rate, profile),
-                new CaseExpectation { MaxAbsCents = 5 });
+                new CaseExpectation { MaxAbsCents = 5, MaxMeanCents = 1, AllowPulseTiming = waveName != "sine" });
         }
     }
 

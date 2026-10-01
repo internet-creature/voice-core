@@ -14,9 +14,14 @@ public partial class LevelTrace : Control
     private int _count;
     private readonly Vector2[] _points = new Vector2[Capacity];
 
+    /// <summary>Current noise floor and level gate (§3.2, §3.3), drawn as reference lines; NaN hides them.</summary>
+    public float NoiseFloorDbfs { get; set; } = float.NaN;
+    public float GateDbfs { get; set; } = float.NaN;
+
     public override void _Ready()
     {
-        CustomMinimumSize = new Vector2(0, 140);
+        if (CustomMinimumSize.Y == 0)
+            CustomMinimumSize = new Vector2(0, 140);
     }
 
     public void Add(float rmsDbfs)
@@ -43,6 +48,15 @@ public partial class LevelTrace : Control
             float y = Y(db);
             DrawLine(new Vector2(0, y), new Vector2(Size.X, y), new Color(1, 1, 1, 0.07f));
             DrawString(ThemeDB.FallbackFont, new Vector2(4, y - 2), db.ToString(), HorizontalAlignment.Left, -1, 10, new Color(1, 1, 1, 0.35f));
+        }
+
+        if (!float.IsNaN(NoiseFloorDbfs))
+            DrawDashedLine(new Vector2(0, Y(NoiseFloorDbfs)), new Vector2(Size.X, Y(NoiseFloorDbfs)), new Color(0.6f, 0.6f, 1f, 0.5f), 1, 5);
+        if (!float.IsNaN(GateDbfs))
+        {
+            DrawDashedLine(new Vector2(0, Y(GateDbfs)), new Vector2(Size.X, Y(GateDbfs)), new Color(1f, 0.8f, 0.3f, 0.6f), 1, 5);
+            DrawString(ThemeDB.FallbackFont, new Vector2(Size.X - 170, Y(GateDbfs) - 3), $"voicing gate {GateDbfs:0} dBFS",
+                HorizontalAlignment.Left, -1, 10, new Color(1f, 0.8f, 0.3f, 0.8f));
         }
 
         if (_count < 2)

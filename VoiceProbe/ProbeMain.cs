@@ -6,10 +6,10 @@ using VoiceProbe.Capture;
 namespace VoiceProbe;
 
 /// <summary>
-/// Build step 3 probe: capture → analyzer → RMS meter, on either capture path,
-/// with the diagnostics, loopback test and camera-test flash the latency budget
-/// needs (spec §3.1, §5, §8). Disposable: keep logic in VoiceCore and
-/// VoiceProbe.Capture, not here.
+/// The phase 0 probe (spec §8 steps 3–4): capture → analyzer → live pitch trace and
+/// level meter, on either capture path, with noise-floor calibration, opt-in
+/// recording, diagnostics, and the latency tests. Disposable: keep logic in
+/// VoiceCore and VoiceProbe.Capture, not here.
 /// </summary>
 /// <remarks>
 /// Headless self-tests, for checking hardware from a terminal:
@@ -17,7 +17,9 @@ namespace VoiceProbe;
 /// and prints diagnostics; <c>--loopback=&lt;output part&gt;,&lt;input part&gt;</c> runs the
 /// loopback test. Both go after <c>--</c> on the Godot command line and quit when done.
 /// <c>--autostart</c> opens the UI already capturing from the preselected device, and
-/// prints diagnostics when capture stops; add <c>--capture=godot</c> for the Godot path.
+/// prints diagnostics when capture stops; add <c>--capture=godot</c> for the Godot path,
+/// <c>--device=&lt;name part&gt;</c> to pick an input, <c>--record</c> to record the session, and
+/// <c>--screenshot=&lt;png&gt;,&lt;seconds&gt;</c> to save the window and quit.
 /// </remarks>
 public partial class ProbeMain : Control
 {
@@ -28,23 +30,44 @@ public partial class ProbeMain : Control
     private const float ClapJumpDb = 20f;
     private const double FlashSeconds = 0.1;
 
+    // a "silent" calibration louder than this was almost certainly not silence
+    private const float LoudestPlausibleFloorDbfs = -35f;
+
+    private const string SettingsPath = "user://probe.cfg";
+    private const string RecordingsDir = "user://recordings";
+
+    private static readonly (string Label, float Min, float Max)[] PitchRanges =
+    [
+        ("60–1000 Hz (full range)", 60, 1000),
+        ("70–500 Hz (speech)", 70, 500),
+        ("120–800 Hz (higher voices)", 120, 800),
+    ];
+
     private readonly AnalysisConfig _config = AnalysisConfig.Default;
-    private readonly AnalysisFrame[] _drain = new AnalysisFrame[FrameQueueDrainSize];
-    private const int FrameQueueDrainSize = 256;
+    private readonly AnalysisFrame[] _drain = new AnalysisFrame[256];
+    private readonly ConfigFile _settings = new();
 
     private AnalysisPipeline? _pipeline;
     private NativeCapture? _native;
     private GodotCapture _godot = null!;
     private SessionLog? _log;
+    private RingRecorder? _recorder;
+    private NoiseFloorCalibration? _calibration;
     private CapturePath _path;
+    private string _deviceLabel = "";
+    private string _floorSource = "";
 
-    private OptionButton _pathPicker = null!, _devicePicker = null!, _outputPicker = null!;
+    private OptionButton _pathPicker = null!, _devicePicker = null!, _outputPicker = null!, _rangePicker = null!;
     private CheckBox _rawToggle = null!, _cameraToggle = null!;
-    private Button _startButton = null!, _loopbackButton = null!;
+    private CheckButton _recordToggle = null!;
+    private Button _startButton = null!, _loopbackButton = null!, _calibrateButton = null!, _deleteButton = null!;
     private Label _status = null!, _diagnostics = null!, _loopbackResult = null!, _cameraHint = null!;
+    private Label _pitchReadout = null!, _floorLabel = null!, _recIndicator = null!;
     private LevelMeter _meter = null!;
     private LevelTrace _trace = null!;
+    private PitchTrace _pitch = null!;
     private ColorRect _flash = null!;
+    private ConfirmationDialog _deleteDialog = null!;
 
     private readonly Queue<float> _recentPeaks = new();
     private double _flashRemaining;
@@ -56,6 +79,7 @@ public partial class ProbeMain : Control
 
     public override void _Ready()
     {
+        _settings.Load(SettingsPath);  // a missing file just means nothing saved yet
         _godot = new GodotCapture();
         AddChild(_godot);
         BuildUi();
@@ -70,11 +94,22 @@ public partial class ProbeMain : Control
             if (args.TryGetValue("capture", out var path) && path == "godot")
                 _pathPicker.Select((int)CapturePath.Godot);
             RefreshDevices();
+            if (args.TryGetValue("device", out var devicePart))
+                for (int i = 0; i < _devicePicker.ItemCount; i++)
+                    if (_devicePicker.GetItemText(i).Contains(devicePart, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _devicePicker.Select(i);
+                        break;
+                    }
             if (args.ContainsKey("autostart"))
             {
                 _printDiagnosticsOnStop = true;
                 StartCapture();
+                if (args.ContainsKey("record"))
+                    _recordToggle.ButtonPressed = true;
             }
+            if (args.TryGetValue("screenshot", out var shot))
+                ScheduleScreenshot(shot);
         }
     }
 
@@ -84,15 +119,25 @@ public partial class ProbeMain : Control
         {
             DrainFrames();
             if (_pipeline.Latest.TryGetLatest(out var latest))
+            {
                 _meter.Show(latest.RmsDbfs, latest.PeakDbfs, latest.Clipping, delta);
+                _pitchReadout.Text = Readout(latest);
+            }
 
             _diagnosticsTimer -= delta;
             if (_diagnosticsTimer <= 0)
             {
                 _diagnosticsTimer = 0.25;
                 _diagnostics.Text = DiagnosticsText();
+                float floor = _pipeline.Analyzer.NoiseFloorDbfs;  // display only; a slightly stale read is fine
+                _trace.NoiseFloorDbfs = floor;
+                _trace.GateDbfs = floor + _config.VoicedLevelMarginDb;
+                _floorLabel.Text = $"noise floor {floor:0.0} dBFS ({_floorSource})";
             }
         }
+
+        if (_recorder is not null)
+            _recIndicator.Text = $"● REC {_recorder.Duration:mm\\:ss}";
 
         _flashRemaining -= delta;
         _flash.Visible = _flashRemaining > 0;
@@ -128,6 +173,7 @@ public partial class ProbeMain : Control
             {
                 var device = _nativeInputs[_devicePicker.Selected];
                 _native = NativeCapture.Open(device, _pipeline, _rawToggle.ButtonPressed);
+                _deviceLabel = device.Label;
                 _log.Write("portaudio.version", DeviceCatalog.PortAudioVersion);
                 _log.Write("device.name", device.Label);
                 _log.Write("device.default_sample_rate", device.DefaultSampleRate);
@@ -135,6 +181,7 @@ public partial class ProbeMain : Control
                 _log.Write("capture.format", _native.Format);
                 _log.Write("capture.resampler_delay_samples", _native.ResamplerDelaySamples.ToString("0.0", CultureInfo.InvariantCulture));
                 _log.Write("os_processing.raw", _native.Raw);
+                ApplySavedNoiseFloor();
                 _pipeline.Start();
                 _native.Start();
                 _status.Text = $"Capturing {device.Label}: {_native.Format}. Raw mode: {RawText(_native.Raw)}";
@@ -142,6 +189,8 @@ public partial class ProbeMain : Control
             else
             {
                 string device = GodotCapture.InputDevices()[_devicePicker.Selected];
+                _deviceLabel = $"{device} [Godot]";
+                ApplySavedNoiseFloor();
                 _pipeline.Start();
                 _godot.Begin(device, _pipeline);
                 _log.Write("device.name", _godot.DeviceName);
@@ -152,7 +201,10 @@ public partial class ProbeMain : Control
                 _status.Text = $"Capturing {_godot.DeviceName} through Godot: {_godot.Format}. Raw mode: not available on this path.";
             }
             _startButton.Text = "Stop";
+            _calibrateButton.Disabled = false;
+            _recordToggle.Disabled = false;
             _trace.Clear();
+            _pitch.Clear();
         }
         catch (Exception e)
         {
@@ -164,6 +216,8 @@ public partial class ProbeMain : Control
 
     private void StopCapture()
     {
+        StopRecording();
+        _calibration = null;
         if (_printDiagnosticsOnStop && _pipeline is not null)
             GD.Print(DiagnosticsText());
         _native?.Dispose();
@@ -177,7 +231,12 @@ public partial class ProbeMain : Control
             _status.Text += $"\nSession log: {_log.Path}";
         _log = null;
         _pipeline = null;
+        if (_startButton is null)
+            return;
         _startButton.Text = "Start";
+        _calibrateButton.Disabled = true;
+        _recordToggle.Disabled = true;
+        _recordToggle.SetPressedNoSignal(false);  // opt-in per session (§0): never carries over
     }
 
     private void DrainFrames()
@@ -186,17 +245,157 @@ public partial class ProbeMain : Control
         {
             int n = _pipeline!.Frames.Drain(_drain, out long dropped);
             if (dropped > 0)
+            {
                 _trace.Clear();  // a gap: don't draw across it (spec §2)
+                _pitch.Clear();
+            }
             for (int i = 0; i < n; i++)
             {
                 _trace.Add(_drain[i].RmsDbfs);
+                _pitch.Add(in _drain[i]);
+                _calibration?.Add(in _drain[i]);
                 if (_cameraToggle.ButtonPressed)
                     DetectClap(_drain[i].PeakDbfs);
             }
+            if (_calibration is { IsComplete: true })
+                FinishCalibration();
             if (n < _drain.Length)
                 return;
         }
     }
+
+    private static string Readout(in AnalysisFrame f) => f.Voicing switch
+    {
+        VoicingState.Voiced when f.F0Range == F0Range.Above => "above the tracker's range",
+        VoicingState.Voiced when float.IsFinite(f.F0Hz) =>
+            $"{f.F0Hz,6:0.0} Hz   {NoteNames.Of(f.F0Hz)}   confidence {f.F0Confidence:0.00} (raw, uncalibrated)",
+        VoicingState.Voiced => "voiced, no pitch",
+        VoicingState.Creak => "creak",
+        VoicingState.Unvoiced => "unvoiced",
+        _ => "—",
+    };
+
+    // --- noise floor calibration (§3.2) ---
+
+    private void StartCalibration()
+    {
+        if (_pipeline is null)
+            return;
+        _calibration = new NoiseFloorCalibration();
+        _calibrateButton.Disabled = true;
+        _floorLabel.Text = "Stay quiet for 2 seconds…";
+    }
+
+    private void FinishCalibration()
+    {
+        float floor = _calibration!.Result();
+        _calibration = null;
+        _calibrateButton.Disabled = false;
+        if (floor > LoudestPlausibleFloorDbfs)
+        {
+            _floorLabel.Text = $"That measured {floor:0.0} dBFS, too loud for silence. Try again in quiet.";
+            return;
+        }
+        _pipeline!.Pump.SetCalibratedNoiseFloor(floor);
+        _settings.SetValue("noise_floor", _deviceLabel, floor);
+        _settings.Save(SettingsPath);
+        _floorSource = "calibrated";
+        _log?.Write("noise_floor_dbfs", $"{floor.ToString("0.0", CultureInfo.InvariantCulture)} (calibrated)");
+    }
+
+    private void ApplySavedNoiseFloor()
+    {
+        var saved = _settings.GetValue("noise_floor", _deviceLabel, Variant.From(float.NaN)).AsSingle();
+        if (float.IsFinite(saved))
+        {
+            _pipeline!.Pump.SetCalibratedNoiseFloor(saved);
+            _floorSource = "saved calibration";
+            _log?.Write("noise_floor_dbfs", $"{saved.ToString("0.0", CultureInfo.InvariantCulture)} (saved)");
+        }
+        else
+        {
+            _floorSource = "default — press Calibrate";
+            _log?.Write("noise_floor_dbfs", $"{_config.DefaultNoiseFloorDbfs.ToString("0.0", CultureInfo.InvariantCulture)} (default)");
+        }
+    }
+
+    // --- opt-in recording (§0: opt-in per session, visibly indicated, deletable) ---
+
+    private void SetRecording(bool on)
+    {
+        if (on)
+            StartRecording();
+        else
+            StopRecording();
+    }
+
+    private void StartRecording()
+    {
+        if (_pipeline is null || _recorder is not null)
+            return;
+        string dir = ProjectSettings.GlobalizePath(RecordingsDir);
+        Directory.CreateDirectory(dir);
+        string name = $"rec-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}";
+        string wav = Path.Combine(dir, name + ".wav");
+        _recorder = new RingRecorder(_pipeline.Audio, wav);
+        File.WriteAllLines(Path.Combine(dir, name + ".txt"),
+        [
+            $"device: {_deviceLabel}",
+            $"capture_path: {_path}",
+            $"format: {(_native is not null ? _native.Format : _godot.Format)}",
+            $"raw: {(_native is not null ? _native.Raw.ToString() : "unknown (Godot path)")}",
+            string.Create(CultureInfo.InvariantCulture, $"noise_floor_dbfs: {_pipeline.Analyzer.NoiseFloorDbfs:0.0}"),
+            $"analyzer_version: {_config.AnalyzerVersion}",
+            $"analyzer_config_hash: {_config.ComputeContentHash()}",
+            $"started: {DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture)}",
+        ]);
+        _recIndicator.Visible = true;
+        _log?.Write("recording.started", wav);
+    }
+
+    private void StopRecording()
+    {
+        if (_recorder is null)
+            return;
+        _recorder.Dispose();
+        string sidecar = Path.ChangeExtension(_recorder.Path, ".txt");
+        File.AppendAllLines(sidecar,
+        [
+            string.Create(CultureInfo.InvariantCulture, $"duration_s: {_recorder.Duration.TotalSeconds:0.00}"),
+            $"dropped_samples: {_recorder.DroppedSamples}",
+        ]);
+        _log?.Write("recording.stopped", $"{_recorder.Path} ({_recorder.Duration.TotalSeconds:0.0} s)");
+        _status.Text = $"Saved recording: {_recorder.Path}";
+        _recorder = null;
+        if (_recIndicator is not null)
+            _recIndicator.Visible = false;
+    }
+
+    private void DeleteAllRecordings()
+    {
+        StopRecording();
+        _recordToggle.SetPressedNoSignal(false);
+        string dir = ProjectSettings.GlobalizePath(RecordingsDir);
+        int deleted = 0;
+        if (Directory.Exists(dir))
+        {
+            foreach (string f in Directory.EnumerateFiles(dir).Where(f => f.EndsWith(".wav", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)))
+            {
+                File.Delete(f);
+                deleted++;
+            }
+        }
+        _status.Text = $"Deleted {deleted} recording file(s).";
+        _log?.Write("recordings.deleted", deleted);
+    }
+
+    private int RecordingCount()
+    {
+        string dir = ProjectSettings.GlobalizePath(RecordingsDir);
+        return Directory.Exists(dir) ? Directory.EnumerateFiles(dir, "*.wav").Count() : 0;
+    }
+
+    // --- camera test ---
 
     /// <summary>
     /// Camera test (spec §3.1): flash the screen when a transient reaches the
@@ -240,6 +439,8 @@ public partial class ProbeMain : Control
         {
             lines.Add($"godot pulls            {_godot.Pulls}   largest pull {_godot.LargestPullFrames} frames (arrival = pull time; hides Godot's buffering)   buffer overflows {_godot.Overflows}");
         }
+        if (_recorder is { DroppedSamples: > 0 })
+            lines.Add($"recorder dropped       {_recorder.DroppedSamples} samples (disk too slow)");
         return string.Join('\n', lines);
     }
 
@@ -318,6 +519,19 @@ public partial class ProbeMain : Control
         GetTree().Quit(result.Detected > 0 ? 0 : 1);
     }
 
+    /// <summary><c>--screenshot=&lt;png path&gt;,&lt;seconds&gt;</c>: save the window after real time passes, then quit.</summary>
+    private void ScheduleScreenshot(string spec)
+    {
+        var parts = spec.Split(',');
+        double seconds = parts.Length > 1 ? double.Parse(parts[1], CultureInfo.InvariantCulture) : 3;
+        GetTree().CreateTimer(seconds).Timeout += () =>
+        {
+            GetViewport().GetTexture().GetImage().SavePng(parts[0]);
+            StopCapture();
+            GetTree().Quit();
+        };
+    }
+
     private static Dictionary<string, string> ParseUserArgs() =>
         OS.GetCmdlineUserArgs()
             .Where(a => a.StartsWith("--", StringComparison.Ordinal))
@@ -370,15 +584,14 @@ public partial class ProbeMain : Control
         var margin = new MarginContainer();
         margin.SetAnchorsPreset(LayoutPreset.FullRect);
         foreach (var side in new[] { "left", "right", "top", "bottom" })
-            margin.AddThemeConstantOverride($"margin_{side}", 16);
+            margin.AddThemeConstantOverride($"margin_{side}", 14);
         AddChild(margin);
 
         var column = new VBoxContainer();
-        column.AddThemeConstantOverride("separation", 10);
+        column.AddThemeConstantOverride("separation", 8);
         margin.AddChild(column);
 
-        column.AddChild(new Label { Text = "VoiceProbe — build step 3: capture → level meter" });
-
+        // capture
         var captureRow = new HBoxContainer();
         column.AddChild(captureRow);
         _pathPicker = new OptionButton();
@@ -394,22 +607,77 @@ public partial class ProbeMain : Control
         _startButton.Pressed += () => { if (_pipeline is null) StartCapture(); else StopCapture(); };
         captureRow.AddChild(_startButton);
 
-        _status = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, Text = "Pick a device and press Start." };
+        _status = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, Text = "Pick a device and press Start.", Modulate = new Color(1, 1, 1, 0.75f) };
         column.AddChild(_status);
 
+        // pitch
+        var pitchRow = new HBoxContainer();
+        column.AddChild(pitchRow);
+        _pitchReadout = new Label { Text = "—", SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        _pitchReadout.AddThemeFontSizeOverride("font_size", 26);
+        _pitchReadout.AddThemeFontOverride("font", new SystemFont { FontNames = ["Consolas", "Cascadia Mono", "monospace"] });
+        pitchRow.AddChild(_pitchReadout);
+        _rangePicker = new OptionButton();
+        foreach (var r in PitchRanges)
+            _rangePicker.AddItem(r.Label);
+        _rangePicker.ItemSelected += i => { _pitch.MinHz = PitchRanges[i].Min; _pitch.MaxHz = PitchRanges[i].Max; };
+        pitchRow.AddChild(_rangePicker);
+        _pitch = new PitchTrace();
+        column.AddChild(_pitch);
+
+        // level
         _meter = new LevelMeter();
         column.AddChild(_meter);
-        column.AddChild(new Label { Text = "RMS, every frame (last 6 s)", Modulate = new Color(1, 1, 1, 0.6f) });
-        _trace = new LevelTrace();
+        _trace = new LevelTrace { CustomMinimumSize = new Vector2(0, 70) };
         column.AddChild(_trace);
 
-        _diagnostics = new Label();
-        _diagnostics.AddThemeFontOverride("font", new SystemFont { FontNames = ["Consolas", "Cascadia Mono", "monospace"] });
-        _diagnostics.AddThemeFontSizeOverride("font_size", 13);
-        column.AddChild(_diagnostics);
+        // calibration and recording
+        var toolsRow = new HBoxContainer();
+        toolsRow.AddThemeConstantOverride("separation", 10);
+        column.AddChild(toolsRow);
+        _calibrateButton = new Button { Text = "Calibrate noise floor", Disabled = true, TooltipText = "Measures 2 s of silence (spec §3.2). Saved per device." };
+        _calibrateButton.Pressed += StartCalibration;
+        toolsRow.AddChild(_calibrateButton);
+        _floorLabel = new Label { Text = "", SizeFlagsHorizontal = SizeFlags.ExpandFill };
+        toolsRow.AddChild(_floorLabel);
+        _recIndicator = new Label { Text = "● REC", Visible = false, Modulate = new Color(1f, 0.25f, 0.25f) };
+        _recIndicator.AddThemeFontSizeOverride("font_size", 18);
+        toolsRow.AddChild(_recIndicator);
+        _recordToggle = new CheckButton { Text = "Record audio (saved to disk)", Disabled = true };
+        _recordToggle.Toggled += SetRecording;
+        toolsRow.AddChild(_recordToggle);
+        var openButton = new Button { Text = "Open recordings" };
+        openButton.Pressed += () =>
+        {
+            string dir = ProjectSettings.GlobalizePath(RecordingsDir);
+            Directory.CreateDirectory(dir);
+            OS.ShellOpen(dir);
+        };
+        toolsRow.AddChild(openButton);
+        _deleteButton = new Button { Text = "Delete all recordings" };
+        _deleteButton.Pressed += () =>
+        {
+            _deleteDialog.DialogText = $"Permanently delete all {RecordingCount()} recording(s)? This can't be undone.";
+            _deleteDialog.PopupCentered();
+        };
+        toolsRow.AddChild(_deleteButton);
+        _deleteDialog = new ConfirmationDialog { Title = "Delete recordings", OkButtonText = "Delete all" };
+        _deleteDialog.Confirmed += DeleteAllRecordings;
+        AddChild(_deleteDialog);
 
+        // diagnostics and latency tests
+        var tabs = new TabContainer { CustomMinimumSize = new Vector2(0, 150) };
+        column.AddChild(tabs);
+
+        _diagnostics = new Label { Name = "Diagnostics" };
+        _diagnostics.AddThemeFontOverride("font", new SystemFont { FontNames = ["Consolas", "Cascadia Mono", "monospace"] });
+        _diagnostics.AddThemeFontSizeOverride("font_size", 12);
+        tabs.AddChild(_diagnostics);
+
+        var latency = new VBoxContainer { Name = "Latency tests" };
+        tabs.AddChild(latency);
         var loopbackRow = new HBoxContainer();
-        column.AddChild(loopbackRow);
+        latency.AddChild(loopbackRow);
         loopbackRow.AddChild(new Label { Text = "Loopback out:" });
         _outputPicker = new OptionButton { SizeFlagsHorizontal = SizeFlags.ExpandFill, ClipText = true, FitToLongestItem = false };
         loopbackRow.AddChild(_outputPicker);
@@ -419,15 +687,13 @@ public partial class ProbeMain : Control
         _loopbackResult = new Label
         {
             AutowrapMode = TextServer.AutowrapMode.WordSmart,
-            Text = "Loopback plays tone bursts on the output and finds them on the input device selected above. " +
-                   "Use a cable, VB-Cable (CABLE Input → CABLE Output), or speakers into the mic.",
+            Text = "Plays tone bursts on the output and finds them on the selected input. Use VB-Cable, or hold headphones/speakers to the mic.",
         };
-        column.AddChild(_loopbackResult);
-
+        latency.AddChild(_loopbackResult);
         _cameraToggle = new CheckBox { Text = "Camera test: flash the screen on a clap" };
-        column.AddChild(_cameraToggle);
+        latency.AddChild(_cameraToggle);
         _cameraHint = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, Modulate = new Color(1, 1, 1, 0.7f) };
-        column.AddChild(_cameraHint);
+        latency.AddChild(_cameraHint);
 
         _flash = new ColorRect { Color = Colors.White, Visible = false, MouseFilter = MouseFilterEnum.Ignore };
         _flash.SetAnchorsPreset(LayoutPreset.FullRect);

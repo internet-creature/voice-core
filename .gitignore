@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Python tooling (tools/praat_compare.py)
+tools/.venv/

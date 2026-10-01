@@ -1,4 +1,4 @@
-# voice training game — design doc & roadmap v2.3
+# voice training game — design doc & roadmap v2.4
 
 companion to `voice-analysis-spec.md`, which covers phase 0. this doc picks up after the analysis prototype clears its decision gate.
 
@@ -205,6 +205,28 @@ the analysis chain has a hard latency floor — YIN needs 2–3 periods of audio
 
 so: **sustained lines, glides, and contours.** no tight timing windows, no discrete note-hits with millisecond judgment. the highway is something you trace, not something you strike. scoring compensates for the measured latency offset (calibration parameter) so the trace is *judged* against where the voice actually was, even though it *renders* late.
 
+**latency calibration is per player, and it's two offsets (v2.4).** end-to-end latency varies a lot by setup. a 144 Hz monitor adds ~10 ms, and a TV outside game mode can add 50–100+ ms. a USB mic adds a few ms, and Bluetooth 150–250 ms each way. the phase 0 baseline on a desktop with a USB mic was an 80 ms audio round trip (analyzer spec §8 step 3). scoring needs two different offsets:
+
+- **visual sync:** the player sings to targets they see. this is always needed.
+- **audio sync:** only needed if the game plays reference tones (part 4).
+
+**what the sync test measures (revised after Sol's review).** a marker sweeps across the screen, and the player says "pa" each time it crosses a line. the audio version is the same with beeps. the measured gap is **not a hardware latency**. it's hardware (display or output, plus mic input) plus the player's own timing: how far they anticipate or trail a beat, and how their onset is produced. a median over repetitions removes scatter, not that consistent personal offset. so the result is a **personal scoring adjustment**, and it's documented, stored and validated as one:
+
+- **why it's still the right thing to score with:** grading asks whether the voice matched the target *as the player experienced it*. a consistent personal lead or lag is part of how this player traces the line, the same way rhythm games' calibration absorbs player habit along with hardware. for a tracing game with sustained lines that's fair. it doesn't paper over a skill the game teaches.
+- **how it's measured:** the onset is detected from the level jump of the "p" burst, not from pitch. voicing in "pa" begins tens of milliseconds after the burst, and that gap varies by speaker. use 8–16 repetitions and take the median.
+- **storage:** offsets are stored per player and per input/output device combination, so plugging in a headset doesn't silently invalidate them.
+- **manual nudge:** a slider lets players who feel it's off adjust it, as rhythm games do.
+- **Bluetooth warning:** its latency is large and can drift, so onboarding recommends a wired or USB mic.
+- **where it helps, hardware can be measured separately:** e.g. an automatic loopback with headphones held to the mic for the audio path. the UI then shows the adjustment as "hardware ~X ms + your timing ~Y ms", so a strange personal component is visible instead of hidden.
+
+calibration fixes *scoring*, not *feel*. the pitch line is drawn at the moment the voice actually happened, so it lines up with the target, but the perceived lag of ~50–100 ms can only be reduced, not calibrated away. that's the reason this is a tracing game.
+
+**validation:** the voice test can't be checked against the camera test within a few milliseconds, because the camera measures hardware only (mouth to screen) and the voice test adds the player. validate it as a personal adjustment instead:
+
+- **repeatability:** the same player on the same setup should get the same offset across sessions, within a tolerance set from playtest data. if it wanders, it isn't stable enough to score with.
+- **decomposition on the developer's machine:** the voice-test offset minus the camera's hardware latency is the personal component. it should be plausible (a few tens of ms) and stable across sessions.
+- **fairness check in playtest:** grade the same runs with and without the adjustment, and ask players which grading matched what they felt they did.
+
 ## 1.8 the highway
 
 - **log-frequency vertical axis**, mapped to the user's assessed range rather than absolute Hz
@@ -281,7 +303,7 @@ these thresholds are **product requirements and live in this document**. the ana
 ### 1a — integration and calibration
 
 - **capture path decision** (new in v2): evaluate native in-process capture (PortAudioSharp, as in VoiceProbe) against Godot's `AudioEffectCapture` before committing. `AudioEffectCapture` routes through Godot's audio server (extra buffering, less control over device format, possible OS-processed stream); VoiceCore doesn't care where buffers come from, so use whichever path measures better on latency and rawness. (v2.3: VoiceProbe is now a Godot project, so this comparison starts in phase 0 at analyzer build step 3. 1a confirms the choice rather than starting it.)
-- **onboarding flow**: device selection, input gain, noise floor measurement, latency offset (loopback or manual tap-to-sync)
+- **onboarding flow**: device selection, input gain, noise floor measurement, latency calibration (the voice-onset sync test from §1.7, a personal scoring adjustment: visual sync always, audio sync if reference tones ship; manual nudge available)
 - **baseline voice assessment**: comfortable speaking f0, range floor and ceiling, resonance baseline, one read passage
 - assessment output writes **observed range and the safe-range gate only** (v2.2 — measurement, not goals). goal bands are *chosen by the user* in a separate onboarding step: the UI may offer starting suggestions relative to the observed range, but the user places and confirms them, may skip entirely, and **goal-band editing ships in the MVP**. this keeps the analyzer-spec rule intact: goals are user-chosen, editable, and default to nothing.
 
@@ -444,6 +466,10 @@ the §1.2 rules made deterministic. the implementation must match this appendix 
 **v2.2 (2026-08-19, second Sol review):** phase 0 exit split into Gate A (analyzer viability, after analyzer step 6, owned by the analyzer spec) and Gate B (product readiness, after step 8, owned here — resonance-signal decision, legibility, latency thresholds), resolving the cross-document gate mismatch; §1.5's "no extra work" claim replaced with a real resonance validation gate backed by a new resonance-manipulation corpus task and brightness-proxy contract in analyzer spec v2; the universal scored band explicitly labeled a hypothesis with a pre-defined eligible-denominator fallback; normative scoring appendix added (frame values, segment-vs-frame accounting, exclusion and completion math, weights and floor, vowel-mismatch policy, PB provenance); replay auto-recording reconciled with the privacy rules (in-memory/temp-encrypted ephemeral audio, crash sweep, pinning as the consent moment); lessons 6 and 8 made educational/ungraded in MVP instead of gating on phase 2 mechanics; assessment rescoped to write observed range and safety only, with goal bands user-chosen and editable from MVP; the safe-range assessment protocol made an SLP-authored phase 1a blocker; §1.11 rescoped — goal-band analytics (no perceptual claims) replace the diagnostic role, and the perception model is off the roadmap with a written reopening bar.
 
 **from review:** judgment windows widened to ≥2× tracker error (v1's Perfect window equaled the phase 0 FPE gate, so tracker noise would grade users); miss segments with debounce, onset/breath grace, honest creak indication, and an unreliable-run abstention rule added to grading; the replay/listen-back loop promoted to a core MVP mechanic with pinning and A/B compare (it was absent from v1 despite being half the product's premise); "three-surface architecture" corrected to four; latency claims updated to analyzer v2's measured definitions (~50–110 ms user-to-photon) with scoring compensated by the calibrated offset; phase 0 gate text aligned with analyzer v2's slice-minimum/regression-gate semantics; weight's dependency on analyzer phase 1 (pulse-synchronous analysis, corrected H1–H2) made explicit, with an unscored meter allowed earlier; `AudioEffectCapture` demoted from assumption to evaluated option against native capture; resonance encoding made redundant (colour + non-colour) as a design constraint rather than an accessibility retrofit; rest days made streak-safe with a soft daily cap on high-intensity practice; voice profile bands changed to user-set goal bands with optional off-by-default reference overlays (also resolves the v1 non-binary open question); vowel-mismatch guard added as unscored feedback; Steam Deck mic added as a phase 0 corpus condition; cloud saves explicitly exclude audio.
+
+**v2.4 (2026-09-29, paired with analyzer spec v2.4):**
+
+- **latency calibration** (§1.7, 1a): it's per player and per device combination, and it's two offsets: visual sync (always) and audio sync (only with reference tones). a voice-onset sync test measures each one ("pa" on a visual or audible beat, detected from the burst's level onset, median of 8–16). per Sol's review, the result is a **personal scoring adjustment**: hardware plus the player's own timing, not a hardware latency. it's validated by repeatability, by decomposition against the camera test on the developer's machine, and by a playtest fairness check, not by millisecond agreement with the camera. a hardware part can be measured separately where possible and shown alongside. manual nudge and Bluetooth warning included. this replaces "loopback or manual tap-to-sync".
 
 **v2.3 (2026-09-28, paired with analyzer spec v2.3):**
 
