@@ -336,7 +336,9 @@ public partial class ProbeMain : Control
             return;
         string dir = ProjectSettings.GlobalizePath(RecordingsDir);
         Directory.CreateDirectory(dir);
-        string name = $"rec-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}";
+        // the device in the name keeps two probe windows recording two mics at once
+        // (spec §6: one performance, several devices) from colliding
+        string name = $"rec-{DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}-{FileSafe(_deviceLabel)}";
         string wav = Path.Combine(dir, name + ".wav");
         _recorder = new RingRecorder(_pipeline.Audio, wav);
         File.WriteAllLines(Path.Combine(dir, name + ".txt"),
@@ -352,6 +354,19 @@ public partial class ProbeMain : Control
         ]);
         _recIndicator.Visible = true;
         _log?.Write("recording.started", wav);
+    }
+
+    /// <summary>"Microphone (AT2020USB-X) [Windows WASAPI]" → "AT2020USB-X": short and filename-safe.</summary>
+    private static string FileSafe(string deviceLabel)
+    {
+        string name = deviceLabel;
+        int open = name.IndexOf('('), close = name.IndexOf(')');
+        if (open >= 0 && close > open + 1)
+            name = name[(open + 1)..close];  // Windows puts the product name in parentheses
+        else if (name.IndexOf('[') is > 0 and var bracket)
+            name = name[..bracket];
+        var safe = new string(name.Trim().Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '-').ToArray()).Trim('-');
+        return safe.Length == 0 ? "mic" : safe.Length > 32 ? safe[..32] : safe;
     }
 
     private void StopRecording()
