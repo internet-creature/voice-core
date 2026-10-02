@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using PortAudioSharp;
 
 namespace VoiceProbe.Capture;
@@ -9,7 +10,12 @@ namespace VoiceProbe.Capture;
 /// <param name="Frames">Samples in the buffer.</param>
 public readonly record struct CallbackStamp(long StopwatchTimestamp, long StartSample, int Frames);
 
-public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTripsMs)
+/// <param name="InputRaw">
+/// The capture configuration of the input side, so results are comparable with live
+/// capture (which requests WASAPI raw mode by default). <see cref="RawCaptureStatus.Requested"/>
+/// is a request the stream accepted, not proof that every effect was bypassed.
+/// </param>
+public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTripsMs, RawCaptureStatus InputRaw = RawCaptureStatus.NotRequested)
 {
     public int Detected => RoundTripsMs.Count;
     public double MedianMs => Percentile(50);
@@ -24,9 +30,10 @@ public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTrip
         return sorted[(int)Math.Round(p / 100 * (sorted.Length - 1))];
     }
 
-    public override string ToString() => Detected == 0
+    public override string ToString() => (Detected == 0
         ? $"no bursts detected (of {Emitted})"
-        : $"round trip median {MedianMs:0.0} ms (min {MinMs:0.0}, max {MaxMs:0.0}), {Detected}/{Emitted} bursts detected";
+        : $"round trip median {MedianMs:0.0} ms (min {MinMs:0.0}, max {MaxMs:0.0}), {Detected}/{Emitted} bursts detected")
+        + $", input raw={InputRaw}";
 }
 
 /// <summary>
@@ -51,7 +58,7 @@ public static class LoopbackTest
     /// whose noise suppression removes 3 ms clicks needs a longer burst.
     /// </summary>
     public static LoopbackResult Run(AudioDevice input, AudioDevice output, int bursts = 10, double intervalSeconds = 0.4,
-        float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false)
+        float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false, bool requestRaw = true)
     {
         DeviceCatalog.EnsureInitialized();
         var inFormat = DeviceCatalog.ChooseFormat(input);
@@ -106,10 +113,16 @@ public static class LoopbackTest
         }
 
         PortAudioSharp.Stream.Callback inCallback = OnInput, outCallback = OnOutput;
+        // the input side asks for raw capture exactly as live capture does (NativeCapture),
+        // so the measured path matches what the analyzer gets
+        var raw = !input.IsWasapi ? (requestRaw ? RawCaptureStatus.Unavailable : RawCaptureStatus.NotRequested)
+            : requestRaw ? RawCaptureStatus.Requested : RawCaptureStatus.NotRequested;
+        IntPtr rawInfo = raw == RawCaptureStatus.Requested ? PortAudioInterop.AllocWasapiRawStreamInfo() : IntPtr.Zero;
         var inParams = new StreamParameters
         {
             device = input.Index, channelCount = inFormat.Channels, sampleFormat = SampleFormat.Float32,
             suggestedLatency = input.DefaultLowInputLatency,
+            hostApiSpecificStreamInfo = rawInfo,
         };
         var outParams = new StreamParameters
         {
@@ -117,7 +130,23 @@ public static class LoopbackTest
             suggestedLatency = PortAudio.GetDeviceInfo(output.Index).defaultLowOutputLatency,
         };
 
-        using var inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+        PortAudioSharp.Stream inStream;
+        try
+        {
+            inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+        }
+        catch (PortAudioException) when (rawInfo != IntPtr.Zero)
+        {
+            inParams.hostApiSpecificStreamInfo = IntPtr.Zero;
+            inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+            raw = RawCaptureStatus.RejectedFellBack;
+        }
+        finally
+        {
+            if (rawInfo != IntPtr.Zero)
+                Marshal.FreeHGlobal(rawInfo);  // PortAudio copied it at open
+        }
+        using var _in = inStream;
         using var outStream = new PortAudioSharp.Stream(null, outParams, outRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, outCallback, null);
         inStream.Start();
         outStream.Start();
@@ -129,7 +158,7 @@ public static class LoopbackTest
 
         var emissions = Enumerable.Range(0, bursts).Select(k => firstBurst + k * burstInterval).ToArray();
         return Analyze(recorded.AsSpan(0, (int)Math.Min(inCount, recorded.Length)), inFormat.SampleRate, inStamps.AsSpan(0, inStampCount),
-            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude, burstSeconds, voice);
+            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude, burstSeconds, voice) with { InputRaw = raw };
     }
 
     /// <summary>

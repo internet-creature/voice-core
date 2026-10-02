@@ -497,7 +497,8 @@ public partial class ProbeMain : Control
         var output = _nativeOutputs[_outputPicker.Selected];
         _loopbackButton.Disabled = true;
         _loopbackResult.Text = $"Running loopback {output.Label} → {input.Label} (~5 s)…";
-        _loopbackTask = Task.Run(() => LoopbackTest.Run(input, output));
+        bool raw = _rawToggle.ButtonPressed;  // the same capture configuration as live capture
+        _loopbackTask = Task.Run(() => LoopbackTest.Run(input, output, requestRaw: raw));
     }
 
     /// <summary>
