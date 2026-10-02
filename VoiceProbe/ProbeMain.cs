@@ -545,13 +545,22 @@ public partial class ProbeMain : Control
         };
     }
 
+    /// <summary>
+    /// <c>--loopback=&lt;output&gt;,&lt;input&gt;[,&lt;interval s&gt;[,&lt;burst ms&gt;|voice]]</c>. A longer interval
+    /// finds slow paths (webcams). "voice" plays a voice-like glide that device noise
+    /// suppression lets through, where it removes tone bursts.
+    /// </summary>
     private void RunLoopbackSelfTest(string spec)
     {
         var parts = spec.Split(',');
         var output = DeviceCatalog.Outputs().First(d => d.Label.Contains(parts[0], StringComparison.OrdinalIgnoreCase));
         var input = DeviceCatalog.Inputs().First(d => d.Label.Contains(parts[1], StringComparison.OrdinalIgnoreCase));
-        var result = LoopbackTest.Run(input, output);
-        GD.Print($"loopback {output.Label} -> {input.Label}: {result}");
+        double interval = parts.Length > 2 ? double.Parse(parts[2], CultureInfo.InvariantCulture) : 0.4;
+        bool voice = parts.Length > 3 && parts[3] == "voice";
+        double burst = parts.Length > 3 && !voice ? double.Parse(parts[3], CultureInfo.InvariantCulture) / 1000 : LoopbackTest.DefaultBurstSeconds;
+        var result = LoopbackTest.Run(input, output, intervalSeconds: interval, burstSeconds: burst, voice: voice);
+        GD.Print(string.Create(CultureInfo.InvariantCulture,
+            $"loopback {output.Label} -> {input.Label} (interval {interval} s, {(voice ? "voice burst" : $"tone burst {burst * 1000} ms")}): {result}"));
         GetTree().Quit(result.Detected > 0 ? 0 : 1);
     }
 

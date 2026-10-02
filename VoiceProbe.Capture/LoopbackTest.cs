@@ -38,13 +38,20 @@ public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTrip
 /// </summary>
 public static class LoopbackTest
 {
-    public const double BurstSeconds = 0.003;
+    public const double DefaultBurstSeconds = 0.003;
+
+    /// <summary>Length of the voice-like burst (<see cref="VoiceBurst"/>).</summary>
+    public const double VoiceBurstSeconds = 0.2;
     public const double BurstHz = 1000;
 
     /// <summary>
     /// Runs the test live. Blocks for about <c>0.5 + bursts × interval</c> seconds.
+    /// Each burst is searched for within 0.9 × interval of its emission, so a path
+    /// slower than that (a webcam's own processing) needs a longer interval. A device
+    /// whose noise suppression removes 3 ms clicks needs a longer burst.
     /// </summary>
-    public static LoopbackResult Run(AudioDevice input, AudioDevice output, int bursts = 10, double intervalSeconds = 0.4, float amplitude = 0.5f)
+    public static LoopbackResult Run(AudioDevice input, AudioDevice output, int bursts = 10, double intervalSeconds = 0.4,
+        float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false)
     {
         DeviceCatalog.EnsureInitialized();
         var inFormat = DeviceCatalog.ChooseFormat(input);
@@ -58,7 +65,7 @@ public static class LoopbackTest
         long inCount = 0, outCount = 0;
         int inStampCount = 0, outStampCount = 0;
 
-        var template = Burst(outRate, amplitude);
+        var template = voice ? VoiceBurst(outRate, amplitude) : Burst(outRate, amplitude, burstSeconds);
         long firstBurst = (long)(0.5 * outRate);
         long burstInterval = (long)(intervalSeconds * outRate);
 
@@ -122,7 +129,7 @@ public static class LoopbackTest
 
         var emissions = Enumerable.Range(0, bursts).Select(k => firstBurst + k * burstInterval).ToArray();
         return Analyze(recorded.AsSpan(0, (int)Math.Min(inCount, recorded.Length)), inFormat.SampleRate, inStamps.AsSpan(0, inStampCount),
-            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude);
+            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude, burstSeconds, voice);
     }
 
     /// <summary>
@@ -133,9 +140,9 @@ public static class LoopbackTest
     public static LoopbackResult Analyze(
         ReadOnlySpan<float> recorded, int inputRate, ReadOnlySpan<CallbackStamp> inputStamps,
         IReadOnlyList<long> emittedAt, int outputRate, ReadOnlySpan<CallbackStamp> outputStamps,
-        double intervalSeconds, float amplitude = 0.5f)
+        double intervalSeconds, float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false)
     {
-        var template = Burst(inputRate, amplitude);
+        var template = voice ? VoiceBurst(inputRate, amplitude) : Burst(inputRate, amplitude, burstSeconds);
         var roundTrips = new List<double>();
         double tick = Stopwatch.Frequency;
 
@@ -171,13 +178,39 @@ public static class LoopbackTest
     }
 
     /// <summary>Hann-windowed 1 kHz tone burst.</summary>
-    internal static float[] Burst(int rate, float amplitude)
+    internal static float[] Burst(int rate, float amplitude, double seconds = DefaultBurstSeconds)
     {
-        var b = new float[(int)(BurstSeconds * rate)];
+        var b = new float[(int)(seconds * rate)];
         for (int i = 0; i < b.Length; i++)
         {
             double w = 0.5 - 0.5 * Math.Cos(2 * Math.PI * i / (b.Length - 1));
             b[i] = (float)(amplitude * w * Math.Sin(2 * Math.PI * BurstHz * i / rate));
+        }
+        return b;
+    }
+
+    /// <summary>
+    /// A voice-like burst for devices whose noise suppression removes tones and
+    /// clicks (webcams): 20 harmonics with a 1/k rolloff on a pitch gliding 150 → 300 Hz
+    /// over 200 ms, Hann-windowed. The glide keeps the correlation from repeating
+    /// at every pitch period, so the match has one peak.
+    /// </summary>
+    internal static float[] VoiceBurst(int rate, float amplitude)
+    {
+        var b = new float[(int)(VoiceBurstSeconds * rate)];
+        double phase = 0, norm = 0;
+        for (int k = 1; k <= 20; k++)
+            norm += 1.0 / k;
+        for (int i = 0; i < b.Length; i++)
+        {
+            double t = i / (double)(b.Length - 1);
+            double f0 = 150 * Math.Pow(2, t);
+            phase += 2 * Math.PI * f0 / rate;
+            double v = 0;
+            for (int k = 1; k <= 20 && k * f0 < rate / 2.0; k++)
+                v += Math.Sin(k * phase) / k;
+            double w = 0.5 - 0.5 * Math.Cos(2 * Math.PI * t);
+            b[i] = (float)(amplitude * w * v / norm * 2);
         }
         return b;
     }

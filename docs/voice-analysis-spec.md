@@ -515,6 +515,20 @@ v1's "~43 ms" counted only the parts that are easy to count. the honest number i
 
 this is why the game is a **tracing** game, not a **hitting** game. sustained lines and glides tolerate this; tight timing windows do not. **measure user-to-photon with the camera test (§3.1) on real hardware before committing to any chart design** — the loopback test only measures the audio half, and gates in §6 are on measured numbers, not this table.
 
+**measured device spread (v2.5, 2026-10-02).** Speaker → mic round trips through the same USB speakers (Realtek USB Audio), WASAPI shared, raw mode requested:
+
+| mic | round trip |
+|---|---|
+| AT2020USB-X (USB condenser) | 118 ms |
+| Razer Kraken Kitty V3 Pro (USB headset) | 157 ms |
+| Insta360 Link 2C Pro (webcam) | **419 ms** |
+
+The input side alone differs by **~300 ms** between mics on one PC. The "5–20 ms" device row above holds for a good USB mic, not for a webcam with on-device processing. A three-mic recording of one performance put the webcam's lag at ~280 ms, which corroborates this.
+
+Two consequences:
+- **Timing compensation has to be per device, not global.** Game doc §1.7's per-player audio sync offset must be re-measured whenever the input device changes.
+- **The tone-burst loopback can't measure processed mics.** The webcam's noise suppression removed the tone bursts entirely. A voice-like gliding burst (`--loopback=<out>,<in>,1.2,voice`) gets through it, and agrees with the tone test within 1 ms on the AT2020.
+
 ---
 
 ## 6. batch mode and the test harness
