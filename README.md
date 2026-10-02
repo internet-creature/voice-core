@@ -60,6 +60,7 @@ Headless checks, from `VoiceProbe/`:
 godot_console --headless --path . --build-solutions --quit
 godot_console --headless --path . -- --selftest=AT2020,3
 godot_console --headless --path . -- "--loopback=CABLE Input,CABLE Output"
+godot_console --headless --path . -- "--loopback=Realtek USB Audio,Insta360,1.2,voice"   # webcams: slow, noise-suppressed
 ```
 
 ## Analyzing recordings and comparing with Praat

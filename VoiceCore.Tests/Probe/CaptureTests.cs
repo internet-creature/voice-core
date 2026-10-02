@@ -172,12 +172,14 @@ public class LoopbackAnalysisTests
     /// Simulated streams: output and input callbacks every 256 samples, input
     /// delivered <paramref name="pathSamples"/> after output hands samples over.
     /// </summary>
-    private static LoopbackResult Simulate(int pathSamples, bool withBursts = true, double noise = 0.001)
+    private static LoopbackResult Simulate(int pathSamples, bool withBursts = true, double noise = 0.001, bool voice = false)
     {
         double ticksPerSample = (double)System.Diagnostics.Stopwatch.Frequency / Rate;
-        int total = Rate * 3;
-        var burst = LoopbackTest.Burst(Rate, 0.5f);
-        long[] emitted = [Rate / 2, Rate / 2 + 19200, Rate / 2 + 38400];
+        double interval = voice ? 1.2 : 0.4;
+        int spacing = (int)(interval * Rate);
+        int total = Rate / 2 + 3 * spacing + Rate;
+        var burst = voice ? LoopbackTest.VoiceBurst(Rate, 0.5f) : LoopbackTest.Burst(Rate, 0.5f);
+        long[] emitted = [Rate / 2, Rate / 2 + spacing, Rate / 2 + 2 * spacing];
 
         var recorded = new float[total];
         var rng = new Random(1);
@@ -194,7 +196,19 @@ public class LoopbackAnalysisTests
         var inStamps = Enumerable.Range(0, total / Buffer)
             .Select(b => new CallbackStamp((long)((b + 1) * Buffer * ticksPerSample), b * Buffer, Buffer)).ToArray();
 
-        return LoopbackTest.Analyze(recorded, Rate, inStamps, emitted, Rate, outStamps, intervalSeconds: 0.4);
+        return LoopbackTest.Analyze(recorded, Rate, inStamps, emitted, Rate, outStamps, intervalSeconds: interval, voice: voice);
+    }
+
+    [Theory]
+    [InlineData(5664)]   // 118 ms: the AT2020 through speakers
+    [InlineData(20088)]  // 418.5 ms: the Insta360 webcam, slower than a tone test's 360 ms window
+    public void VoiceBurstsRecoverSlowPathsExactly(int pathSamples)
+    {
+        // webcams' noise suppression removes tone bursts but passes voice; the
+        // voice burst's pitch glide keeps the match from locking to a wrong period
+        var result = Simulate(pathSamples, voice: true);
+        Assert.Equal(3, result.Detected);
+        Assert.All(result.RoundTripsMs, rt => Assert.Equal(pathSamples * 1000.0 / Rate, rt, 0.05));
     }
 
     [Theory]

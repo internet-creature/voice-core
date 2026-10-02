@@ -515,6 +515,22 @@ v1's "~43 ms" counted only the parts that are easy to count. the honest number i
 
 this is why the game is a **tracing** game, not a **hitting** game. sustained lines and glides tolerate this; tight timing windows do not. **measure user-to-photon with the camera test (§3.1) on real hardware before committing to any chart design** — the loopback test only measures the audio half, and gates in §6 are on measured numbers, not this table.
 
+**measured device spread (v2.5, 2026-10-02).** Speaker → mic round trips through the same USB speakers (Realtek USB Audio), WASAPI shared, voice-like burst, 10/10 detected unless noted. The first column was measured before the loopback test requested raw mode, so the input used Windows' default processing. The second requests raw exactly as live capture does:
+
+| mic | default processing | raw requested |
+|---|---|---|
+| AT2020USB-X (USB condenser) | 118.2 ms | **100.8 ms** (tone burst: 110.6) |
+| Razer Kraken Kitty V3 Pro (USB headset) | 157.3 ms | 0/10 detected: re-measure pending |
+| Insta360 Link 2C Pro (webcam) | 418.5 ms | **363.0 ms** |
+
+Findings:
+- **Default Windows processing adds ~17 ms on the AT2020 and ~55 ms on the webcam.** That's one more reason live capture requests raw mode, and why loopback has to match live capture's configuration to be comparable.
+- **The input side differs by ~260 ms between mics on one PC.** The "5–20 ms" device row above holds for a good USB mic, not for a webcam with on-device processing. A three-mic recording of one performance put the webcam's lag at ~280 ms, which roughly corroborates this.
+- **Timing compensation has to be per device, not global.** Game doc §1.7's per-player audio sync offset must be re-measured whenever the input device changes.
+- **The tone-burst loopback can't measure processed mics.** The webcam's tone-burst runs produced no usable measurement (0/10 found, or 2/10 with impossible lags), consistent with its noise suppression removing tones and clicks. A voice-like gliding burst (`--loopback=<out>,<in>,1.2,voice`) gets through.
+- **Burst types differ by a few ms on the same path:** voice vs tone on the AT2020 was 118.2 vs 116.7 ms (default processing) and 100.8 vs 110.6 ms (raw). Compare mics only with the same burst type.
+- **These are round trips** (output buffering + acoustic path + input path), not input-only delays. With the output held constant they're good relative comparisons between mics, but they shouldn't be copied straight into a gameplay offset.
+
 ---
 
 ## 6. batch mode and the test harness

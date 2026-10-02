@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using PortAudioSharp;
 
 namespace VoiceProbe.Capture;
@@ -9,7 +10,12 @@ namespace VoiceProbe.Capture;
 /// <param name="Frames">Samples in the buffer.</param>
 public readonly record struct CallbackStamp(long StopwatchTimestamp, long StartSample, int Frames);
 
-public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTripsMs)
+/// <param name="InputRaw">
+/// The capture configuration of the input side, so results are comparable with live
+/// capture (which requests WASAPI raw mode by default). <see cref="RawCaptureStatus.Requested"/>
+/// is a request the stream accepted, not proof that every effect was bypassed.
+/// </param>
+public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTripsMs, RawCaptureStatus InputRaw = RawCaptureStatus.NotRequested)
 {
     public int Detected => RoundTripsMs.Count;
     public double MedianMs => Percentile(50);
@@ -24,9 +30,10 @@ public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTrip
         return sorted[(int)Math.Round(p / 100 * (sorted.Length - 1))];
     }
 
-    public override string ToString() => Detected == 0
+    public override string ToString() => (Detected == 0
         ? $"no bursts detected (of {Emitted})"
-        : $"round trip median {MedianMs:0.0} ms (min {MinMs:0.0}, max {MaxMs:0.0}), {Detected}/{Emitted} bursts detected";
+        : $"round trip median {MedianMs:0.0} ms (min {MinMs:0.0}, max {MaxMs:0.0}), {Detected}/{Emitted} bursts detected")
+        + $", input raw={InputRaw}";
 }
 
 /// <summary>
@@ -38,13 +45,20 @@ public sealed record LoopbackResult(int Emitted, IReadOnlyList<double> RoundTrip
 /// </summary>
 public static class LoopbackTest
 {
-    public const double BurstSeconds = 0.003;
+    public const double DefaultBurstSeconds = 0.003;
+
+    /// <summary>Length of the voice-like burst (<see cref="VoiceBurst"/>).</summary>
+    public const double VoiceBurstSeconds = 0.2;
     public const double BurstHz = 1000;
 
     /// <summary>
     /// Runs the test live. Blocks for about <c>0.5 + bursts × interval</c> seconds.
+    /// Each burst is searched for within 0.9 × interval of its emission, so a path
+    /// slower than that (a webcam's own processing) needs a longer interval. A device
+    /// whose noise suppression removes 3 ms clicks needs a longer burst.
     /// </summary>
-    public static LoopbackResult Run(AudioDevice input, AudioDevice output, int bursts = 10, double intervalSeconds = 0.4, float amplitude = 0.5f)
+    public static LoopbackResult Run(AudioDevice input, AudioDevice output, int bursts = 10, double intervalSeconds = 0.4,
+        float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false, bool requestRaw = true)
     {
         DeviceCatalog.EnsureInitialized();
         var inFormat = DeviceCatalog.ChooseFormat(input);
@@ -58,7 +72,7 @@ public static class LoopbackTest
         long inCount = 0, outCount = 0;
         int inStampCount = 0, outStampCount = 0;
 
-        var template = Burst(outRate, amplitude);
+        var template = voice ? VoiceBurst(outRate, amplitude) : Burst(outRate, amplitude, burstSeconds);
         long firstBurst = (long)(0.5 * outRate);
         long burstInterval = (long)(intervalSeconds * outRate);
 
@@ -99,10 +113,16 @@ public static class LoopbackTest
         }
 
         PortAudioSharp.Stream.Callback inCallback = OnInput, outCallback = OnOutput;
+        // the input side asks for raw capture exactly as live capture does (NativeCapture),
+        // so the measured path matches what the analyzer gets
+        var raw = !input.IsWasapi ? (requestRaw ? RawCaptureStatus.Unavailable : RawCaptureStatus.NotRequested)
+            : requestRaw ? RawCaptureStatus.Requested : RawCaptureStatus.NotRequested;
+        IntPtr rawInfo = raw == RawCaptureStatus.Requested ? PortAudioInterop.AllocWasapiRawStreamInfo() : IntPtr.Zero;
         var inParams = new StreamParameters
         {
             device = input.Index, channelCount = inFormat.Channels, sampleFormat = SampleFormat.Float32,
             suggestedLatency = input.DefaultLowInputLatency,
+            hostApiSpecificStreamInfo = rawInfo,
         };
         var outParams = new StreamParameters
         {
@@ -110,7 +130,23 @@ public static class LoopbackTest
             suggestedLatency = PortAudio.GetDeviceInfo(output.Index).defaultLowOutputLatency,
         };
 
-        using var inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+        PortAudioSharp.Stream inStream;
+        try
+        {
+            inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+        }
+        catch (PortAudioException) when (rawInfo != IntPtr.Zero)
+        {
+            inParams.hostApiSpecificStreamInfo = IntPtr.Zero;
+            inStream = new PortAudioSharp.Stream(inParams, null, inFormat.SampleRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, inCallback, null);
+            raw = RawCaptureStatus.RejectedFellBack;
+        }
+        finally
+        {
+            if (rawInfo != IntPtr.Zero)
+                Marshal.FreeHGlobal(rawInfo);  // PortAudio copied it at open
+        }
+        using var _in = inStream;
         using var outStream = new PortAudioSharp.Stream(null, outParams, outRate, NativeCapture.FramesPerBuffer, StreamFlags.ClipOff, outCallback, null);
         inStream.Start();
         outStream.Start();
@@ -122,7 +158,7 @@ public static class LoopbackTest
 
         var emissions = Enumerable.Range(0, bursts).Select(k => firstBurst + k * burstInterval).ToArray();
         return Analyze(recorded.AsSpan(0, (int)Math.Min(inCount, recorded.Length)), inFormat.SampleRate, inStamps.AsSpan(0, inStampCount),
-            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude);
+            emissions, outRate, outStamps.AsSpan(0, outStampCount), intervalSeconds, amplitude, burstSeconds, voice) with { InputRaw = raw };
     }
 
     /// <summary>
@@ -133,9 +169,9 @@ public static class LoopbackTest
     public static LoopbackResult Analyze(
         ReadOnlySpan<float> recorded, int inputRate, ReadOnlySpan<CallbackStamp> inputStamps,
         IReadOnlyList<long> emittedAt, int outputRate, ReadOnlySpan<CallbackStamp> outputStamps,
-        double intervalSeconds, float amplitude = 0.5f)
+        double intervalSeconds, float amplitude = 0.5f, double burstSeconds = DefaultBurstSeconds, bool voice = false)
     {
-        var template = Burst(inputRate, amplitude);
+        var template = voice ? VoiceBurst(inputRate, amplitude) : Burst(inputRate, amplitude, burstSeconds);
         var roundTrips = new List<double>();
         double tick = Stopwatch.Frequency;
 
@@ -171,13 +207,39 @@ public static class LoopbackTest
     }
 
     /// <summary>Hann-windowed 1 kHz tone burst.</summary>
-    internal static float[] Burst(int rate, float amplitude)
+    internal static float[] Burst(int rate, float amplitude, double seconds = DefaultBurstSeconds)
     {
-        var b = new float[(int)(BurstSeconds * rate)];
+        var b = new float[(int)(seconds * rate)];
         for (int i = 0; i < b.Length; i++)
         {
             double w = 0.5 - 0.5 * Math.Cos(2 * Math.PI * i / (b.Length - 1));
             b[i] = (float)(amplitude * w * Math.Sin(2 * Math.PI * BurstHz * i / rate));
+        }
+        return b;
+    }
+
+    /// <summary>
+    /// A voice-like burst for devices whose noise suppression removes tones and
+    /// clicks (webcams): 20 harmonics with a 1/k rolloff on a pitch gliding 150 → 300 Hz
+    /// over 200 ms, Hann-windowed. The glide keeps the correlation from repeating
+    /// at every pitch period, so the match has one peak.
+    /// </summary>
+    internal static float[] VoiceBurst(int rate, float amplitude)
+    {
+        var b = new float[(int)(VoiceBurstSeconds * rate)];
+        double phase = 0, norm = 0;
+        for (int k = 1; k <= 20; k++)
+            norm += 1.0 / k;
+        for (int i = 0; i < b.Length; i++)
+        {
+            double t = i / (double)(b.Length - 1);
+            double f0 = 150 * Math.Pow(2, t);
+            phase += 2 * Math.PI * f0 / rate;
+            double v = 0;
+            for (int k = 1; k <= 20 && k * f0 < rate / 2.0; k++)
+                v += Math.Sin(k * phase) / k;
+            double w = 0.5 - 0.5 * Math.Cos(2 * Math.PI * t);
+            b[i] = (float)(amplitude * w * v / norm * 2);
         }
         return b;
     }
